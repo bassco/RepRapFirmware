@@ -18,7 +18,7 @@ M569 P1 S1							; Drive 1 goes forwards
 M569 P2 S1							; Drive 2 goes forwards
 M569 P3 S1							; Drive 3 goes backwards
 M569 P4 S0							; Drive 4 goes backwards
-M574 X2 Y2 Z2 P1					; set endstop configuration (all endstops at high end, active high)
+M574 X2 Y2 Z2 S1					; set endstop configuration (all endstops at high end, active high)
 
 M665 L218.0 R105 H284 B80 X0 Y0	Z0; set delta radius, diagonal rod length, printable radius, homed height and XY tower corrections
 M666 X0 Y0 Z0						; put your endstop adjustments here, or use auto calibration to find them
