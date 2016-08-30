@@ -7,17 +7,17 @@
 
 G21 ; set units to millimeters
 M107
-M104 S195 ; set temperature
+M104 S185 ; set temperature
 ; layer_height = 0.25
 G21 ; set units to millimeters
 G90 ; use absolute coordinates
 M83 ; use relative distances for extrusion
 G1 Z10 F500 ; lift nozzle
-G1 X-85 Y0 F4000; Go to wait for warm position
+G1 X-55 Y0 F4000; Go to wait for warm position
 T0
 M116; Wait for all temperatures
 G1 E4 F500
-M109 S195 ; wait for temperature to be reached
+M109 S185 ; wait for temperature to be reached
 G90 ; use absolute coordinates
 M83 ; use relative distances for extrusion
 G1 F2700.000 E-4.00000
