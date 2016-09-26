@@ -20,8 +20,8 @@ M569 P3 S1							; Drive 3 goes backwards
 M569 P4 S0							; Drive 4 goes backwards
 M574 X2 Y2 Z2 S1					; set endstop configuration (all endstops at high end, active high)
 
-M665 L229.87 R113.74 H283.52 B75 X-1.52 Y-0.95	Z0; set diagonal rod length, delta radius, homed height, printable radius and XY tower corrections
-M666 X1.52 Y-1.05 Z-0.46			; put your endstop adjustments here, or use auto calibration to find them
+M665 L220.14 R107.10 H280.82 B75 X-0.56 Y-0.33	Z0; set diagonal rod length, delta radius, homed height, printable radius and XY tower corrections
+M666 X0.93 Y-0.72 Z-0.21			; put your endstop adjustments here, or use auto calibration to find them
 ;;M92 X160 Y160 Z160					; Set axis steps/mm (20 tooth pulleys, 0.9deg/step motors)
 M92 X100 Y100 Z100					; Set axis steps/mm (16 tooth pulleys, 1.8deg/step motors)
 M906 X1000 Y1000 Z1000 E800			; Set motor currents (mA)
@@ -37,17 +37,18 @@ M83                                 ; ...but relative extruder moves
 M305 P1 T100000 B4388 R4700 H0 L0	; E3Dv6 hot end. Put your own H and/or L values here if necessary to set the first nozzle thermistor ADC correction.
 M301 H0 P20 I0.5 D1000 T0.85 W150 B5 ; PID settings for the bed
 ;; M301 H1 P10 I0.20 D50 T0.50		; PID settings for extruder 0
-M307 H1 A576.6 C238.8 D8.3 B0 ; Auto-Tune E3DV6 HE
+;; M301 H1 P8.0 I0.04 D49.0 T0.5 B20 W127 S0.8
+M307 H1 A496.7 C194.7 D8.7 B0 S0.8 ; Auto-Tune E3DV6 HE
 M570 S200							; Allow extra heating time
 
 ; Tool definitions
 M563 P0 D0 H1                       ; Define tool 0
 G10 P0 S0 R0                        ; Set tool 0 operating and standby temperatures
-M92 E417                            ; Set extruder steps per mm for first and second extruders
+M92 E405                            ; Set extruder steps per mm for first and second extruders
 
 ; Z probe and compensation definition
 M558 P1 X0 Y0 Z0 H3 F300 T8000		; Z probe is IR and is not used for homing any axes, Z probe dive height 3mm, probing speed 300mm/min, travel speed 12000mm/min
-G31 X0 Y0 Z2.15 P500				; Set the zprobe offset and threshold (put your own values here). For a delta, use zero X and Y offset.
+G31 X0 Y0 Z2.55 P500				; Set the zprobe offset and threshold (put your own values here). For a delta, use zero X and Y offset.
 
 ;*** If you are using axis compensation, put the figures in the following command
 M556 S78 X0 Y0 Z0                   ; Axis compensation here
