@@ -1,2 +1,2 @@
-; Extrude 5mm filament
-G1 E-100 F2000
+; Extrude 100mm filament
+G1 E100 F500
