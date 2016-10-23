@@ -43,7 +43,7 @@ void Heat::Init()
 			pids[heater]->Init(DefaultHotEndHeaterGain, DefaultHotEndHeaterTimeConstant, DefaultHotEndHeaterDeadTime, true);
 		}
 	}
-	lastTime = millis();
+	lastTime = millis() - platform->HeatSampleInterval();		// flag the PIDS as due for spinning
 	longWait = platform->Time();
 	coldExtrude = false;
 	active = true;
@@ -86,7 +86,7 @@ void Heat::Spin()
 
 void Heat::Diagnostics(MessageType mtype)
 {
-	platform->MessageF(mtype, "Heat Diagnostics:\nBed heater = %d, chamber heater = %d\n", bedHeater, chamberHeater);
+	platform->MessageF(mtype, "=== Heat ===\nBed heater = %d, chamber heater = %d\n", bedHeater, chamberHeater);
 	for (size_t heater=0; heater < HEATERS; heater++)
 	{
 		if (pids[heater]->Active())
@@ -210,12 +210,12 @@ void Heat::ResetFault(int8_t heater)
 	}
 }
 
-float Heat::GetAveragePWM(int8_t heater) const
+float Heat::GetAveragePWM(size_t heater) const
 {
 	return pids[heater]->GetAveragePWM();
 }
 
-uint32_t Heat::GetLastSampleTime(int8_t heater) const
+uint32_t Heat::GetLastSampleTime(size_t heater) const
 {
 	return pids[heater]->GetLastSampleTime();
 }

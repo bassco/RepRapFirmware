@@ -27,9 +27,10 @@
 
 Tool * Tool::freelist = nullptr;
 
-/*static*/Tool * Tool::Create(int toolNumber, long d[], size_t dCount, long h[], size_t hCount)
+/*static*/Tool * Tool::Create(int toolNumber, long d[], size_t dCount, long h[], size_t hCount, long xMap[], size_t xCount)
 {
-	if (dCount > DRIVES - AXES)
+	const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
+	if (dCount > DRIVES - numAxes)
 	{
 		reprap.GetPlatform()->Message(GENERIC_MESSAGE,
 				"Error: Tool creation: attempt to use more drives than there are in the RepRap");
@@ -59,19 +60,19 @@ Tool * Tool::freelist = nullptr;
 	t->active = false;
 	t->driveCount = dCount;
 	t->heaterCount = hCount;
+	t->xmapCount = xCount;
 	t->heaterFault = false;
 	t->mixing = false;
 	t->displayColdExtrudeWarning = false;
 
-	for (size_t axis = 0; axis < AXES; axis++)
+	for (size_t axis = 0; axis < MAX_AXES; axis++)
 	{
 		t->offset[axis] = 0.0;
 	}
 
 	if (t->driveCount > 0)
 	{
-		float r = 1.0 / (float) (t->driveCount);
-
+		const float r = 1.0 / (float) (t->driveCount);
 		for (size_t drive = 0; drive < t->driveCount; drive++)
 		{
 			t->drives[drive] = d[drive];
@@ -79,14 +80,16 @@ Tool * Tool::freelist = nullptr;
 		}
 	}
 
-	if (t->heaterCount > 0)
+	for (size_t heater = 0; heater < t->heaterCount; heater++)
 	{
-		for (size_t heater = 0; heater < t->heaterCount; heater++)
-		{
-			t->heaters[heater] = h[heater];
-			t->activeTemperatures[heater] = ABS_ZERO;
-			t->standbyTemperatures[heater] = ABS_ZERO;
-		}
+		t->heaters[heater] = h[heater];
+		t->activeTemperatures[heater] = ABS_ZERO;
+		t->standbyTemperatures[heater] = ABS_ZERO;
+	}
+
+	for (size_t xi = 0; xi < t->xmapCount; ++xi)
+	{
+		t->xMapping[xi] = xMap[xi];
 	}
 
 	return t;
@@ -103,29 +106,31 @@ Tool * Tool::freelist = nullptr;
 
 void Tool::Print(StringRef& reply)
 {
-	reply.printf("Tool %d - drives: ", myNumber);
-	char comma = ',';
+	reply.printf("Tool %d - drives:", myNumber);
+	char sep = ' ';
 	for (size_t drive = 0; drive < driveCount; drive++)
 	{
-		if (drive >= driveCount - 1)
-		{
-			comma = ';';
-		}
-		reply.catf("%d%c", drives[drive], comma);
+		reply.catf("%c%d", sep, drives[drive]);
+		sep = ',';
 	}
 
-	reply.cat(" heaters (active/standby temps): ");
-	comma = ',';
+	reply.cat("; heaters (active/standby temps):");
+	sep = ' ';
 	for (size_t heater = 0; heater < heaterCount; heater++)
 	{
-		if (heater >= heaterCount - 1)
-		{
-			comma = ';';
-		}
-		reply.catf("%d (%.1f/%.1f)%c", heaters[heater], activeTemperatures[heater], standbyTemperatures[heater], comma);
+		reply.catf("%c%d (%.1f/%.1f)", sep, heaters[heater], activeTemperatures[heater], standbyTemperatures[heater]);
+		sep = ',';
 	}
 
-	reply.catf(" status: %s", active ? "selected" : "standby");
+	reply.cat("; xmap:");
+	sep = ' ';
+	for (size_t xi = 0; xi < xmapCount; ++xi)
+	{
+		reply.catf("%c%c", sep, GCodes::axisLetters[xi]);
+		sep = ',';
+	}
+
+	reply.catf("; status: %s", active ? "selected" : "standby");
 }
 
 float Tool::MaxFeedrate() const
@@ -137,9 +142,10 @@ float Tool::MaxFeedrate() const
 		return 1.0;
 	}
 	float result = 0.0;
+	const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
 	for (size_t d = 0; d < driveCount; d++)
 	{
-		float mf = reprap.GetPlatform()->MaxFeedrate(drives[d] + AXES);
+		float mf = reprap.GetPlatform()->MaxFeedrate(drives[d] + numAxes);
 		if (mf > result)
 		{
 			result = mf;
@@ -156,9 +162,10 @@ float Tool::InstantDv() const
 		return 1.0;
 	}
 	float result = FLT_MAX;
+	const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
 	for (size_t d = 0; d < driveCount; d++)
 	{
-		float idv = reprap.GetPlatform()->ActualInstantDv(drives[d] + AXES);
+		float idv = reprap.GetPlatform()->ActualInstantDv(drives[d] + numAxes);
 		if (idv < result)
 		{
 			result = idv;

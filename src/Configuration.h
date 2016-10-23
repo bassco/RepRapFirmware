@@ -26,11 +26,11 @@ Licence: GPL
 // Firmware name is now defined in the Pins file
 
 #ifndef VERSION
-# define VERSION "1.15d"
+# define VERSION "1.16beta3"
 #endif
 
 #ifndef DATE
-# define DATE "2016-09-24"
+# define DATE "2016-10-20"
 #endif
 
 #define AUTHORS "reprappro, dc42, zpl, t3p3, dnewman"
@@ -98,13 +98,13 @@ const float DefaultBedHeaterTimeConstant = 700.0;
 const float DefaultBedHeaterDeadTime = 10.0;
 
 // Parameters used to detect heating errors
-const float MaxHeatingFaultTime = 5.0;				// How many seconds we allow a heating fault to persist
+const float DefaultMaxHeatingFaultTime = 5.0;		// How many seconds we allow a heating fault to persist
 const float AllowedTemperatureDerivativeNoise = 0.25;	// How much fluctuation in the averaged temperature derivative we allow
 const float MaxAmbientTemperature = 45.0;			// We expect heaters to cool to this temperature or lower when switched off
 const float NormalAmbientTemperature = 25.0;		// The ambient temperature we assume - allow for the printer heating its surroundings a little
-const float MaxStableTemperatureError = 10.0;		// How much error we tolerate when maintaining temperature before deciding that a heater fault has occurred
+const float DefaultMaxTempExcursion = 10.0;			// How much error we tolerate when maintaining temperature before deciding that a heater fault has occurred
 
-static_assert(MaxStableTemperatureError > TEMPERATURE_CLOSE_ENOUGH, "MaxStableTemperatureError is too low");
+static_assert(DefaultMaxTempExcursion > TEMPERATURE_CLOSE_ENOUGH, "DefaultMaxTempExcursion is too low");
 
 // Temperature sense channels
 const unsigned int FirstThermocoupleChannel = 100;	// Temperature sensor channels 100... are thermocouples
@@ -193,17 +193,6 @@ const float FILAMENT_WIDTH = 1.75;					// Millimetres
 
 #define CONFIG_FILE "config.g"
 #define DEFAULT_FILE "default.g"
-#define HOME_X_G "homex.g"
-#define HOME_Y_G "homey.g"
-#define HOME_Z_G "homez.g"
-#define HOME_ALL_G "homeall.g"
-#define HOME_DELTA_G "homedelta.g"
-#define BED_EQUATION_G "bed.g"
-#define PAUSE_G "pause.g"
-#define RESUME_G "resume.g"
-#define CANCEL_G "cancel.g"
-#define STOP_G "stop.g"
-#define SLEEP_G "sleep.g"
 
 #define EOF_STRING "<!-- **EoF** -->"
 
