@@ -27,9 +27,10 @@
 
  The supported requests are GET requests for files (for which the root is the www directory on the
  SD card), and the following. These all start with "/rr_". Ordinary files used for the web interface
- must not have names starting "/rr_" or they will not be found.
+ must not have names starting "/rr_" or they will not be found. Times should be generally specified
+ in the format YYYY-MM-DDTHH:MM:SS so the firmware can parse them.
 
- rr_connect?password=xxx
+ rr_connect?password=xxx&time=yyy
              Sent by the web interface software to establish an initial connection, indicating that
  	 	 	 any state variables relating to the web interface (e.g. file upload in progress) should
  	 	 	 be reset. This only happens if the password could be verified.
@@ -64,7 +65,7 @@
  rr_download?name=xxx
 			 Download a specified file from the SD card
 
- rr_upload?name=xxx
+ rr_upload?name=xxx&time=yyy
  	 	 	 Upload a specified file using a POST request. The payload of this request has to be
  	 	 	 the file content. Only one file may be uploaded at once. When the upload has finished,
  	 	 	 a JSON response with the variable "err" will be returned, which will be 0 if the job
@@ -180,7 +181,7 @@ void Webserver::Spin()
 }
 
 // This is called to process a file upload request.
-void Webserver::StartUpload(HttpSession& session, const char* fileName, uint32_t fileLength)
+void Webserver::StartUpload(HttpSession& session, const char* fileName, uint32_t fileLength, time_t lastModified)
 {
 	CancelUpload(session);
 	if (uploadIp != 0)
@@ -197,6 +198,8 @@ void Webserver::StartUpload(HttpSession& session, const char* fileName, uint32_t
 		else
 		{
 			session.fileBeingUploaded.Set(file);
+			strncpy(session.filenameBeingUploaded, fileName, FILENAME_LENGTH);
+			session.fileLastModified = lastModified;
 			session.postLength = fileLength;
 			session.bytesWritten = 0;
 			session.nextFragment = 1;
@@ -222,6 +225,11 @@ void Webserver::FinishUpload(HttpSession& session)
 		else if (session.bytesWritten != session.postLength)
 		{
 			session.uploadState = wrongLength;
+		}
+		else if (session.fileLastModified != 0)
+		{
+			// Upload OK, update the file timestamp if it was specified before
+			(void)platform->GetMassStorage()->SetLastModifiedTime(session.filenameBeingUploaded, session.fileLastModified);
 		}
 	}
 
@@ -450,9 +458,6 @@ void Webserver::HandleGCodeReply(const WebSource source, OutputBuffer *reply)
 	switch (source)
 	{
 	case WebSource::HTTP:
-#if 0
-		OutputBuffer::ReleaseAll(reply);
-#else
 		if (reply != nullptr)
 		{
 			if (numSessions > 0)
@@ -469,7 +474,6 @@ void Webserver::HandleGCodeReply(const WebSource source, OutputBuffer *reply)
 				OutputBuffer::ReleaseAll(reply);
 			}
 		}
-#endif
 		break;
 
 	case WebSource::Telnet:
@@ -485,8 +489,6 @@ void Webserver::HandleGCodeReply(const WebSource source, const char *reply)
 	switch (source)
 	{
 	case WebSource::HTTP:
-#if 0
-#else
 		if (numSessions > 0)
 		{
 			OutputBuffer *buffer = gcodeReply->GetLastItem();
@@ -503,7 +505,6 @@ void Webserver::HandleGCodeReply(const WebSource source, const char *reply)
 			buffer->cat(reply);
 			seq++;
 		}
-#endif
 		break;
 
 	case WebSource::Telnet:
@@ -513,26 +514,44 @@ void Webserver::HandleGCodeReply(const WebSource source, const char *reply)
 }
 
 //----------------------------------------------------------------------------------------------------
+// Return the value of the specified key, or nullptr if not present
+const char* Webserver::GetKeyValue(const char *key) const
+{
+	for (size_t i = 0; i < numQualKeys; ++i)
+	{
+		if (StringEquals(qualifiers[i].key, key))
+		{
+			return qualifiers[i].value;
+		}
+	}
+	return nullptr;
+}
 
 // Process the first fragment of input from the client.
 // Return true if the session should be kept open.
 bool Webserver::ProcessFirstFragment(HttpSession& session, const char* command, bool isOnlyFragment)
 {
-	// Get the first two key/value pairs
-	const char* key1 = (numQualKeys >= 1) ? qualifiers[0].key : "";
-	const char* value1 = (numQualKeys >= 1) ? qualifiers[0].value : "";
-	const char* key2 = (numQualKeys >= 2) ? qualifiers[1].key : "";
-	const char* value2 = (numQualKeys >= 2) ? qualifiers[1].value : "";
-
 	// Process connect messages first
-	if (StringEquals(command, "connect") && StringEquals(key1, "password"))
+	if (StringEquals(command, "connect") && GetKeyValue("password") != nullptr)
 	{
 		OutputBuffer *response;
 		if (OutputBuffer::Allocate(response))
 		{
-			if (session.isAuthenticated || reprap.CheckPassword(value1))
+			if (session.isAuthenticated || reprap.CheckPassword(GetKeyValue("password")))
 			{
-				// Password OK
+				// Password is OK, see if we can update the current RTC date and time
+				const char *timeVal = GetKeyValue("time");
+				if (timeVal != nullptr && !platform->IsDateTimeSet())
+				{
+					struct tm timeInfo;
+					if (strptime(timeVal, "%Y-%m-%dT%H:%M:%S", &timeInfo) != nullptr)
+					{
+						time_t newTime = mktime(&timeInfo);
+						platform->SetDateTime(newTime);
+					}
+				}
+
+				// Client has logged in
 				session.isAuthenticated = true;
 				response->printf("{\"err\":0,\"sessionTimeout\":%u,\"boardType\":\"%s\"}", httpSessionTimeout, platform->GetBoardString());
 			}
@@ -588,19 +607,30 @@ bool Webserver::ProcessFirstFragment(HttpSession& session, const char* command, 
 		return false;
 	}
 
-	if (StringEquals(command, "download") && StringEquals(key1, "name"))
+	if (StringEquals(command, "download") && GetKeyValue("name") != nullptr)
 	{
-		SendFile(value1, session);
+		SendFile(GetKeyValue("name"), session);
 		return false;
 	}
 
 	if (StringEquals(command, "upload"))
 	{
-		if (StringEquals(key1, "name") && StringEquals(key2, "length"))
+		const char* nameVal = GetKeyValue("name");
+		const char* lengthVal = GetKeyValue("length");
+		const char* timeVal = GetKeyValue("time");
+		if (nameVal != nullptr && lengthVal != nullptr)
 		{
+			// Try to obtain the last modified time
+			time_t fileLastModified = 0;
+			struct tm timeInfo;
+			if (timeVal != nullptr && strptime(timeVal, "%Y-%m-%dT%H:%M:%S", &timeInfo) != nullptr)
+			{
+				fileLastModified = mktime(&timeInfo);
+			}
+
 			// Deal with file upload request
-			uint32_t fileLength = atol(value2);
-			StartUpload(session, value1, fileLength);
+			uint32_t fileLength = atol(lengthVal);
+			StartUpload(session, nameVal, fileLength, fileLastModified);
 			if (session.uploadState == uploading)
 			{
 				if (isOnlyFragment)
@@ -623,9 +653,11 @@ bool Webserver::ProcessFirstFragment(HttpSession& session, const char* command, 
 	if (StringEquals(command, "move"))
 	{
 		const char* response =  "{\"err\":1}";		// assume failure
-		if (StringEquals(key1, "old") && StringEquals(key2, "new"))
+		const char* oldVal = GetKeyValue("old");
+		const char* newVal = GetKeyValue("new");
+		if (oldVal != nullptr && newVal != nullptr)
 		{
-			bool success = platform->GetMassStorage()->Rename(value1, value2);
+			bool success = platform->GetMassStorage()->Rename(oldVal, newVal);
 			if (success)
 			{
 				response =  "{\"err\":0}";
@@ -638,9 +670,10 @@ bool Webserver::ProcessFirstFragment(HttpSession& session, const char* command, 
 	if (StringEquals(command, "mkdir"))
 	{
 		const char* response =  "{\"err\":1}";		// assume failure
-		if (StringEquals(key1, "dir"))
+		const char* dirVal = GetKeyValue("dir");
+		if (dirVal != nullptr)
 		{
-			bool ok = (platform->GetMassStorage()->MakeDirectory(value1));
+			bool ok = (platform->GetMassStorage()->MakeDirectory(dirVal));
 			if (ok)
 			{
 				response =  "{\"err\":0}";
@@ -653,9 +686,10 @@ bool Webserver::ProcessFirstFragment(HttpSession& session, const char* command, 
 	if (StringEquals(command, "delete"))
 	{
 		const char* response =  "{\"err\":1}";		// assume failure
-		if (StringEquals(key1, "name"))
+		const char* nameVal = GetKeyValue("name");
+		if (nameVal != nullptr)
 		{
-			bool ok = platform->GetMassStorage()->Delete("0:/", value1);
+			bool ok = platform->GetMassStorage()->Delete("0:/", nameVal);
 			if (ok)
 			{
 				response =  "{\"err\":0}";
@@ -669,11 +703,11 @@ bool Webserver::ProcessFirstFragment(HttpSession& session, const char* command, 
 	OutputBuffer *response = nullptr;
 	if (StringEquals(command, "status"))
 	{
-		int type = 0;
-		if (StringEquals(key1, "type"))
+		const char* typeVal = GetKeyValue("type");
+		if (typeVal != nullptr)
 		{
 			// New-style JSON status responses
-			type = atoi(value1);
+			int type = atoi(typeVal);
 			if (type < 1 || type > 3)
 			{
 				type = 1;
@@ -688,9 +722,10 @@ bool Webserver::ProcessFirstFragment(HttpSession& session, const char* command, 
 	}
 	else if (StringEquals(command, "gcode"))
 	{
-		if (StringEquals(key1, "gcode"))
+		const char* gcodeVal = GetKeyValue("gcode");
+		if (gcodeVal != nullptr)
 		{
-			LoadGcodeBuffer(value1);
+			LoadGcodeBuffer(gcodeVal);
 			if (OutputBuffer::Allocate(response))
 			{
 				response->printf("{\"buff\":%u}", GetGCodeBufferSpace());
@@ -702,26 +737,25 @@ bool Webserver::ProcessFirstFragment(HttpSession& session, const char* command, 
 			return false;
 		}
 	}
-	else if (StringEquals(command, "filelist") && StringEquals(key1, "dir"))
+	else if (StringEquals(command, "filelist") && GetKeyValue("dir") != nullptr)
 	{
-		response = reprap.GetFilelistResponse(value1);
+		response = reprap.GetFilelistResponse(GetKeyValue("dir"));
 	}
 	else if (StringEquals(command, "files"))
 	{
-		const char* dir = (StringEquals(key1, "dir")) ? value1 : platform->GetGCodeDir();
-		bool flagDirs = false;
-		if (numQualKeys >= 2)
+		const char* dir = GetKeyValue("dir");
+		if (dir == nullptr)
 		{
-			if (StringEquals(qualifiers[1].key, "flagDirs"))
-			{
-				flagDirs = StringEquals(qualifiers[1].value, "1");
-			}
+			dir = platform->GetGCodeDir();
 		}
+		const char* flagDirsVal = GetKeyValue("flagDirs");
+		bool flagDirs = flagDirsVal != nullptr && atoi(flagDirsVal) == 1;
 		response = reprap.GetFilesResponse(dir, flagDirs);
 	}
 	else if (StringEquals(command, "fileinfo"))
 	{
-		if (reprap.GetPrintMonitor()->GetFileInfoResponse(StringEquals(key1, "name") ? value1 : nullptr, response))
+		const char* nameVal = GetKeyValue("name");
+		if (reprap.GetPrintMonitor()->GetFileInfoResponse(nameVal, response))
 		{
 			processingDeferredRequest = false;
 		}

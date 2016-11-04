@@ -27,21 +27,37 @@
 
 Tool * Tool::freelist = nullptr;
 
-/*static*/Tool * Tool::Create(int toolNumber, long d[], size_t dCount, long h[], size_t hCount, long xMap[], size_t xCount)
+/*static*/Tool * Tool::Create(int toolNumber, long d[], size_t dCount, long h[], size_t hCount, long xMap[], size_t xCount, uint32_t fanMap)
 {
-	const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
-	if (dCount > DRIVES - numAxes)
+	const size_t numExtruders = reprap.GetGCodes()->GetNumExtruders();
+	if (dCount > ARRAY_SIZE(Tool::drives))
 	{
-		reprap.GetPlatform()->Message(GENERIC_MESSAGE,
-				"Error: Tool creation: attempt to use more drives than there are in the RepRap");
+		reprap.GetPlatform()->Message(GENERIC_MESSAGE, "Error: Tool creation: too many drives");
 		return nullptr;
 	}
 
-	if (hCount > HEATERS)
+	if (hCount > ARRAY_SIZE(Tool::heaters))
 	{
-		reprap.GetPlatform()->Message(GENERIC_MESSAGE,
-				"Error: Tool creation: attempt to use more heaters than there are in the RepRap");
+		reprap.GetPlatform()->Message(GENERIC_MESSAGE, "Error: Tool creation: too many heaters");
 		return nullptr;
+	}
+
+	// Validate the heater and extruder numbers
+	for (size_t i = 0; i < dCount; ++i)
+	{
+		if (d[i] < 0 || d[i] >= (int)numExtruders)
+		{
+			reprap.GetPlatform()->Message(GENERIC_MESSAGE, "Error: Tool creation: bad drive number");
+			return nullptr;
+		}
+	}
+	for (size_t i = 0; i < hCount; ++i)
+	{
+		if (h[i] < 0 || h[i] >= HEATERS)
+		{
+			reprap.GetPlatform()->Message(GENERIC_MESSAGE, "Error: Tool creation: bad heater number");
+			return nullptr;
+		}
 	}
 
 	Tool *t;
@@ -61,6 +77,7 @@ Tool * Tool::freelist = nullptr;
 	t->driveCount = dCount;
 	t->heaterCount = hCount;
 	t->xmapCount = xCount;
+	t->fanMapping = fanMap;
 	t->heaterFault = false;
 	t->mixing = false;
 	t->displayColdExtrudeWarning = false;
@@ -128,6 +145,17 @@ void Tool::Print(StringRef& reply)
 	{
 		reply.catf("%c%c", sep, GCodes::axisLetters[xi]);
 		sep = ',';
+	}
+
+	reply.cat("; fans:");
+	sep = ' ';
+	for (size_t fi = 0; fi < NUM_FANS; ++fi)
+	{
+		if ((fanMapping & (1u << fi)) != 0)
+		{
+			reply.catf("%c%u", sep, fi);
+			sep = ',';
+		}
 	}
 
 	reply.catf("; status: %s", active ? "selected" : "standby");
@@ -325,9 +353,10 @@ void Tool::UpdateExtruderAndHeaterCount(uint16_t &numExtruders, uint16_t &numHea
 		}
 	}
 
+	const int8_t bedHeater = reprap.GetHeat()->GetBedHeater();
 	for (size_t heater = 0; heater < heaterCount; heater++)
 	{
-		if (heaters[heater] != BED_HEATER && heaters[heater] >= numHeaters)
+		if (heaters[heater] != bedHeater && heaters[heater] >= numHeaters)
 		{
 			numHeaters = heaters[heater] + 1;
 		}
@@ -339,6 +368,14 @@ bool Tool::DisplayColdExtrudeWarning()
 	bool result = displayColdExtrudeWarning;
 	displayColdExtrudeWarning = false;
 	return result;
+}
+
+void Tool::DefineMix(const float m[])
+{
+	for(size_t drive = 0; drive < driveCount; drive++)
+	{
+		mix[drive] = m[drive];
+	}
 }
 
 // End

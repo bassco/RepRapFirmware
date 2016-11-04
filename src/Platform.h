@@ -41,6 +41,7 @@ Licence: GPL
 #include <malloc.h>
 #include <cstdlib>
 #include <climits>
+#include <ctime>
 
 // Platform-specific includes
 
@@ -51,12 +52,13 @@ Licence: GPL
 #include "Libraries/Fatfs/ff.h"
 
 #if defined(DUET_NG)
-# include "SX1509B.h"
+# include "DueXn.h"
 #else
 # include "Libraries/MCP4461/MCP4461.h"
 #endif
 
 #include "Storage/FileStore.h"
+#include "Storage/FileData.h"
 #include "MessageType.h"
 
 // Definitions needed by Fan.h
@@ -110,7 +112,7 @@ const float defaultDeltaHomedHeight = 200;						// mm
 
 const float Z_PROBE_STOP_HEIGHT = 0.7;							// Millimetres
 const unsigned int Z_PROBE_AVERAGE_READINGS = 8;				// We average this number of readings with IR on, and the same number with IR off
-const int ZProbeTypeDelta = 6;									// Z probe type for experimental delta probe
+const int ZProbeTypeDelta = 7;									// Z probe type for experimental delta probe
 
 #ifdef DUET_NG
 const int Z_PROBE_AD_VALUE = 500;								// Default for the Z probe - should be overwritten by experiment
@@ -237,17 +239,12 @@ enum class DiagnosticTestType : int
 	PrintMoves = 100				// print summary of recent moves
 };
 
-// Info returned by FindFirst/FindNext calls
-class FileInfo
+// Enumeration to describe what we want to do with a logical pin
+enum class PinAccess : int
 {
-public:
-
-	bool isDirectory;
-	unsigned long size;
-	uint8_t day;
-	uint8_t month;
-	uint16_t year;
-	char fileName[FILENAME_LENGTH];
+	read,
+	write,
+	servo
 };
 
 /***************************************************************************************************************/
@@ -256,7 +253,7 @@ public:
 
 struct ZProbeParameters
 {
-	int32_t adcValue;				// the target ADC value
+	int32_t adcValue;				// the target ADC value, after inversion if enabled
 	float xOffset, yOffset;			// the offset of the probe relative to the print head
 	float height;					// the nozzle height at which the target ADC value is returned
 	float calibTemperature;			// the temperature at which we did the calibration
@@ -265,6 +262,7 @@ struct ZProbeParameters
 	float probeSpeed;				// the initial speed of probing
 	float travelSpeed;				// the speed at which we travel to the probe point
 	float param1, param2;			// extra parameters used by some types of probe e.g. Delta probe
+	bool invertReading;				// true if we need to invert the reading
 
 	void Init(float h)
 	{
@@ -277,6 +275,7 @@ struct ZProbeParameters
 		probeSpeed = DEFAULT_PROBE_SPEED;
 		travelSpeed = DEFAULT_TRAVEL_SPEED;
 		param1 = param2 = 0.0;
+		invertReading = false;
 	}
 
 	float GetStopHeight(float temperature) const
@@ -296,7 +295,8 @@ struct ZProbeParameters
 				&& probeSpeed == other.probeSpeed
 				&& travelSpeed == other.travelSpeed
 				&& param1 == other.param1
-				&& param2 == other.param2;
+				&& param2 == other.param2
+				&& invertReading == other.invertReading;
 	}
 
 	bool operator!=(const ZProbeParameters& other) const
@@ -457,7 +457,15 @@ public:
 	static bool ScheduleInterrupt(uint32_t tim);	// Schedule an interrupt at the specified clock count, or return true if it has passed already
 	static void DisableStepInterrupt();				// Make sure we get no step interrupts
 	void Tick();
-  
+
+	// Real-time clock
+
+	bool IsDateTimeSet() const;						// Has the RTC been set yet?
+	time_t GetDateTime() const;						// Retrieves the current RTC datetime and returns true if it's valid
+	bool SetDateTime(time_t time);					// Sets the current RTC date and time or returns false on error
+	bool SetDate(time_t date);						// Sets the current RTC date or returns false on error
+	bool SetTime(time_t time);						// Sets the current RTC time or returns false on error
+
   	// Communications and data storage
   
 	bool GCodeAvailable(const SerialSource source) const;
@@ -583,7 +591,7 @@ public:
 	void SetZProbeAxes(uint32_t axes);
 	uint32_t GetZProbeAxes() const { return nvData.zProbeAxes; }
 	const ZProbeParameters& GetZProbeParameters() const;
-	bool SetZProbeParameters(const struct ZProbeParameters& params);
+	void SetZProbeParameters(const struct ZProbeParameters& params);
 	bool MustHomeXYBeforeZ() const;
 
 	void SetExtrusionAncilliaryPWM(float v);
@@ -612,7 +620,7 @@ public:
 	bool AnyHeaterHot(uint16_t heaters, float t);			// called to see if we need to turn on the hot end fan
 
 	// Fans
-	Fan& GetFan(size_t fanNumber)									// Get access to the fan control object
+	Fan& GetFan(size_t fanNumber)							// Get access to the fan control object
 	pre(fanNumber < NUM_FANS)
 	{
 		return fans[fanNumber];
@@ -620,6 +628,9 @@ public:
 
 	float GetFanValue(size_t fan) const;					// Result is returned in percent
 	void SetFanValue(size_t fan, float speed);				// Accepts values between 0..1 and 1..255
+#ifndef DUET_NG
+	void EnableSharedFan(bool enable);						// enable/disable the fan that shares its PWM pin with the last heater
+#endif
 	float GetFanRPM();
 
 	// Flash operations
@@ -646,18 +657,24 @@ public:
 	// So you can test for inkjet presence with if(platform->Inkjet(0))
 	bool Inkjet(int bitPattern);
 
-	// Direct pin operations
-	bool SetPin(int pin, float level);
-
 	// MCU temperature
 	void GetMcuTemperatures(float& minT, float& currT, float& maxT) const;
 	void SetMcuTemperatureAdjust(float v) { mcuTemperatureAdjust = v; }
 	float GetMcuTemperatureAdjust() const { return mcuTemperatureAdjust; }
 
+	// Low level port access
+	static void SetPinMode(Pin p, PinMode mode);
+	static bool ReadPin(Pin p);
+	static void WriteDigital(Pin p, bool high);
+	static void WriteAnalog(Pin p, float pwm, uint16_t frequency);
+
 #ifdef DUET_NG
 	// Power in voltage
 	void GetPowerVoltages(float& minV, float& currV, float& maxV) const;
 #endif
+
+	// User I/O and servo support
+	bool GetFirmwarePin(int logicalPin, PinAccess access, Pin& firmwarePin, bool& invert);
 
 //-------------------------------------------------------------------------------------------------------
   
@@ -692,7 +709,7 @@ private:
 	struct FlashData
 	{
 		static const uint16_t magicValue = 0xE6C4;	// value we use to recognise that the flash data has been written
-		static const uint16_t versionValue = 3;		// increment this whenever this struct changes
+		static const uint16_t versionValue = 4;		// increment this whenever this struct changes
 		static const uint32_t nvAddress = (SoftwareResetData::nvAddress + sizeof(SoftwareResetData) + 3) & (~3);
 
 		uint16_t magic;
@@ -756,7 +773,6 @@ private:
 	float maxAverageAcceleration;
 
 #if defined(DUET_NG)
-	SX1509B expansion;								// I/O expander on DueXn board
 	size_t numTMC2660Drivers;						// the number of TMC2660 drivers we have, the remaining are simple enable/step/dir drivers
 #else
 	// Digipots
@@ -805,6 +821,7 @@ private:
 	Pin coolingFanRpmPin;											// we currently support only one fan RPM input
 	float lastRpmResetTime;
 	void InitFans();
+	bool FansHardwareInverted() const;
 
   	// Serial/USB
 
@@ -889,110 +906,72 @@ private:
 #endif
 
 	// Direct pin manipulation
-	static const uint8_t pinAccessAllowed[NUM_PINS_ALLOWED/8];
-	uint8_t pinInitialised[NUM_PINS_ALLOWED/8];
+	int8_t logicalPinModes[HighestLogicalPin + 1];		// what mode each logical pin is set to - would ideally be class PinMode not int8_t
 };
 
-// Small class to hold an open file and data relating to it.
-// This is designed so that files are never left open and we never duplicate a file reference.
-class FileData
+/*static*/ inline void Platform::SetPinMode(Pin pin, PinMode mode)
 {
-public:
-	FileData() : f(NULL) {}
-
-	// Set this to refer to a newly-opened file
-	void Set(FileStore* pfile)
+#ifdef DUET_NG
+	if (pin >= ExpansionStart)
 	{
-		Close();	// close any existing file
-		f = pfile;
+		DuetExpansion::SetPinMode(pin - ExpansionStart, mode);
 	}
-
-	bool IsLive() const { return f != NULL; }
-
-	bool Close()
+	else
 	{
-		if (f != NULL)
-		{
-			bool ok = f->Close();
-			f = NULL;
-			return ok;
-		}
-		return false;
+		pinMode(pin, mode);
 	}
+#else
+	pinMode(pin, mode);
+#endif
+}
 
-	bool Read(char& b)
+/*static*/ inline bool Platform::ReadPin(Pin pin)
+{
+#ifdef DUET_NG
+	if (pin >= ExpansionStart)
 	{
-		return f->Read(b);
+		return DuetExpansion::DigitalRead(pin - ExpansionStart);
 	}
-
-	bool Write(char b)
+	else
 	{
-		return f->Write(b);
+		return digitalRead(pin);
 	}
+#else
+	return digitalRead(pin);
+#endif
+}
 
-	bool Write(const char *s, unsigned int len)
+/*static*/ inline void Platform::WriteDigital(Pin pin, bool high)
+{
+#ifdef DUET_NG
+	if (pin >= ExpansionStart)
 	{
-		return f->Write(s, len);
+		DuetExpansion::DigitalWrite(pin - ExpansionStart, high);
 	}
-
-	bool Flush()
+	else
 	{
-		return f->Flush();
+		digitalWrite(pin, high);
 	}
+#else
+	digitalWrite(pin, high);
+#endif
+}
 
-	FilePosition GetPosition() const
+/*static*/ inline void Platform::WriteAnalog(Pin pin, float pwm, uint16_t freq)
+{
+#ifdef DUET_NG
+	if (pin >= ExpansionStart)
 	{
-		return f->Position();
+		DuetExpansion::AnalogOut(pin - ExpansionStart, pwm);
 	}
-
-	bool Seek(FilePosition position)
+	else
 	{
-		return f->Seek(position);
+		AnalogOut(pin, pwm, freq);
 	}
-
-	float FractionRead() const
-	{
-		return (f == NULL ? -1.0 : f->FractionRead());
-	}
-
-	FilePosition Length() const
-	{
-		return f->Length();
-	}
-
-	// Assignment operator
-	void CopyFrom(const FileData& other)
-	{
-		Close();
-		f = other.f;
-		if (f != NULL)
-		{
-			f->Duplicate();
-		}
-	}
-
-	// Move operator
-	void MoveFrom(FileData& other)
-	{
-		Close();
-		f = other.f;
-		other.Init();
-	}
-
-private:
-	FileStore *f;
-
-	void Init()
-	{
-		f = NULL;
-	}
-
-	// Private assignment operator to prevent us assigning these objects
-	FileData& operator=(const FileData&);
-
-	// Private copy constructor to prevent us copying these objects
-	FileData(const FileData&);
-};
+#else
+	AnalogOut(pin, pwm);
+#endif
+}
 
 // Where the htm etc files are
 
@@ -1262,7 +1241,7 @@ inline uint16_t Platform::GetRawZProbeReading() const
 	{
 	case 4:
 		{
-			bool b = digitalRead(endStopPins[E0_AXIS]);
+			bool b = ReadPin(endStopPins[E0_AXIS]);
 			if (!endStopLogicLevel[MAX_AXES])
 			{
 				b = !b;
@@ -1271,7 +1250,7 @@ inline uint16_t Platform::GetRawZProbeReading() const
 		}
 
 	case 5:
-		return (digitalRead(zProbePin)) ? 4000 : 0;
+		return (ReadPin(zProbePin)) ? 4000 : 0;
 
 	default:
 		return AnalogInReadChannel(zProbeAdcChannel);
