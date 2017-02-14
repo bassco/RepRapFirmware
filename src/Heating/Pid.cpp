@@ -5,8 +5,11 @@
  *      Author: David
  */
 
-#include "RepRapFirmware.h"
 #include "Pid.h"
+#include "GCodes/GCodes.h"
+#include "Heat.h"
+#include "Platform.h"
+#include "RepRap.h"
 
 // Private constants
 const uint32_t InitialTuningReadingInterval = 250;	// the initial reading interval in milliseconds
@@ -31,8 +34,14 @@ PID::PID(Platform* p, int8_t h) : platform(p), heater(h), mode(HeaterMode::off)
 {
 }
 
-void PID::Init(float pGain, float pTc, float pTd, bool usePid)
+inline void PID::SetHeater(float power) const
 {
+	platform->SetHeater(heater, power);
+}
+
+void PID::Init(float pGain, float pTc, float pTd, float tempLimit, bool usePid)
+{
+	temperatureLimit = tempLimit;
 	maxTempExcursion = DefaultMaxTempExcursion;
 	maxHeatingFaultTime = DefaultMaxHeatingFaultTime;
 	model.SetParameters(pGain, pTc, pTd, 1.0, usePid);
@@ -59,7 +68,6 @@ void PID::Reset()
 	badTemperatureCount = 0;
 	active = false; 						// default to standby temperature
 	tuned = false;
-	useModel = true;						// by default we use the model in this first release
 	averagePWM = lastPwm = 0.0;
 	heatingFaultCount = 0;
 	temperature = BAD_ERROR_TEMPERATURE;
@@ -108,7 +116,7 @@ TemperatureError PID::ReadTemperature()
 		{
 			err = TemperatureError::openCircuit;
 		}
-		else if (temperature > platform->GetTemperatureLimit())
+		else if (temperature > temperatureLimit)
 		{
 			err = TemperatureError::tooHigh;
 		}
@@ -179,7 +187,6 @@ void PID::Spin()
 	{
 		// Read the temperature
 		const TemperatureError err = ReadTemperature();
-		const PidParameters& pp = platform->GetPidParameters(heater);
 
 		// Handle any temperature reading error and calculate the temperature rate of change, if possible
 		if (err != TemperatureError::success)
@@ -313,38 +320,19 @@ void PID::Spin()
 			else if (mode < HeaterMode::tuning0)
 			{
 				// Performing normal temperature control
-				bool usingPid = (useModel) ? model.UsePid() : pp.UsePID();
-				float maxPwm = (useModel) ? model.GetMaxPwm() : pp.kS;
-				if (usingPid)
+				if (model.UsePid())
 				{
 					// Using PID mode. Determine the PID parameters to use.
-					float kP, recipTi, tD, gain;
-					bool inLoadMode;
-					if (useModel)
-					{
-						inLoadMode = (mode == HeaterMode::stable);	// use standard PID when maintaining temperature
-						const PidParams& params = model.GetPidParameters(inLoadMode);
-						kP = params.kP;
-						recipTi = params.recipTi;
-						tD = params.tD;
-						gain = model.GetGain();
-					}
-					else
-					{
-						inLoadMode = true;							// use standard PID always
-						kP = (pp.kP * pp.kS) * (1.0/255.0);
-						recipTi = pp.kI/pp.kP;
-						tD = pp.kD/pp.kP;
-						gain = 255.0/pp.kT;
-					}
+					const bool inLoadMode = (mode == HeaterMode::stable);	// use standard PID when maintaining temperature
+					const PidParameters& params = model.GetPidParameters(inLoadMode);
 
 					// If the P and D terms together demand that the heater is full on or full off, disregard the I term
-					const float errorMinusDterm = error - (tD * derivative);
-					const float pPlusD = kP * errorMinusDterm;
-					const float expectedPwm = constrain<float>((temperature - NormalAmbientTemperature)/gain, 0.0, maxPwm);
-					if (pPlusD + expectedPwm > maxPwm)
+					const float errorMinusDterm = error - (params.tD * derivative);
+					const float pPlusD = params.kP * errorMinusDterm;
+					const float expectedPwm = constrain<float>((temperature - NormalAmbientTemperature)/model.GetGain(), 0.0, model.GetMaxPwm());
+					if (pPlusD + expectedPwm > model.GetMaxPwm())
 					{
-						lastPwm = maxPwm;
+						lastPwm = model.GetMaxPwm();
 						// If we are heating up, preset the I term to the expected PWM at this temperature, ready for the switch over to PID
 						if (mode == HeaterMode::heating && error > 0.0 && derivative > 0.0)
 						{
@@ -360,16 +348,17 @@ void PID::Spin()
 						// In the following we use a modified PID when the temperature is a long way off target.
 						// During initial heating or cooling, the D term represents expected overshoot, which we don't want to add to the I accumulator.
 						// When we are in load mode, the I term is much larger and the D term doesn't represent overshoot, so use normal PID.
-						const float errorToUse = (inLoadMode) ? error : errorMinusDterm;
-						iAccumulator = constrain<float>(iAccumulator + (errorToUse * kP * recipTi * platform->HeatSampleInterval() * MillisToSeconds),
-														0.0, maxPwm);
-						lastPwm = constrain<float>(pPlusD + iAccumulator, 0.0, maxPwm);
+						const float errorToUse = (inLoadMode || model.ArePidParametersOverridden()) ? error : errorMinusDterm;
+						iAccumulator = constrain<float>
+										(iAccumulator + (errorToUse * params.kP * params.recipTi * platform->HeatSampleInterval() * MillisToSeconds),
+											0.0, model.GetMaxPwm());
+						lastPwm = constrain<float>(pPlusD + iAccumulator, 0.0, model.GetMaxPwm());
 					}
 				}
 				else
 				{
 					// Using bang-bang mode
-					lastPwm = (error > 0.0) ? maxPwm : 0.0;
+					lastPwm = (error > 0.0) ? model.GetMaxPwm() : 0.0;
 				}
 			}
 			else
@@ -397,7 +386,7 @@ void PID::Spin()
 
 void PID::SetActiveTemperature(float t)
 {
-	if (t > platform->GetTemperatureLimit())
+	if (t > temperatureLimit)
 	{
 		platform->MessageF(GENERIC_MESSAGE, "Error: Temperature %.1f too high for heater %d!\n", t, heater);
 	}
@@ -413,7 +402,7 @@ void PID::SetActiveTemperature(float t)
 
 void PID::SetStandbyTemperature(float t)
 {
-	if (t > platform->GetTemperatureLimit())
+	if (t > temperatureLimit)
 	{
 		platform->MessageF(GENERIC_MESSAGE, "Error: Temperature %.1f too high for heater %d!\n", t, heater);
 	}
@@ -771,7 +760,6 @@ void PID::FitCurve()
 	tuned = SetModel(gain, tc, td, model.GetMaxPwm(), true);
 	if (tuned)
 	{
-		useModel = true;
 		platform->MessageF(GENERIC_MESSAGE,
 				"Auto tune heater %d with PWM=%.2f completed in %u sec, maximum temperature reached %.1fC\n"
 				"Use M307 H%d to see the result\n",
@@ -786,7 +774,7 @@ void PID::FitCurve()
 void PID::DisplayBuffer(const char *intro)
 {
 	OutputBuffer *buf;
-	if (OutputBuffer::Allocate(buf, false))
+	if (OutputBuffer::Allocate(buf))
 	{
 		buf->catf("%s: interval %.1f sec, readings", intro, tuningReadingInterval * MillisToSeconds);
 		for (size_t i = 0; i < tuningReadingsTaken; ++i)

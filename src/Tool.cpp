@@ -23,11 +23,16 @@
 
  ****************************************************************************************************/
 
-#include "RepRapFirmware.h"
+#include "Tool.h"
+
+#include "GCodes/GCodes.h"
+#include "Heating/Heat.h"
+#include "Platform.h"
+#include "RepRap.h"
 
 Tool * Tool::freelist = nullptr;
 
-/*static*/Tool * Tool::Create(int toolNumber, long d[], size_t dCount, long h[], size_t hCount, long xMap[], size_t xCount, uint32_t fanMap)
+/*static*/Tool * Tool::Create(int toolNumber, long d[], size_t dCount, long h[], size_t hCount, uint32_t xMap, uint32_t fanMap)
 {
 	const size_t numExtruders = reprap.GetGCodes()->GetNumExtruders();
 	if (dCount > ARRAY_SIZE(Tool::drives))
@@ -76,11 +81,12 @@ Tool * Tool::freelist = nullptr;
 	t->active = false;
 	t->driveCount = dCount;
 	t->heaterCount = hCount;
-	t->xmapCount = xCount;
+	t->xMapping = xMap;
 	t->fanMapping = fanMap;
 	t->heaterFault = false;
 	t->mixing = false;
 	t->displayColdExtrudeWarning = false;
+	t->virtualExtruderPosition = 0.0;
 
 	for (size_t axis = 0; axis < MAX_AXES; axis++)
 	{
@@ -102,11 +108,6 @@ Tool * Tool::freelist = nullptr;
 		t->heaters[heater] = h[heater];
 		t->activeTemperatures[heater] = ABS_ZERO;
 		t->standbyTemperatures[heater] = ABS_ZERO;
-	}
-
-	for (size_t xi = 0; xi < t->xmapCount; ++xi)
-	{
-		t->xMapping[xi] = xMap[xi];
 	}
 
 	return t;
@@ -141,10 +142,13 @@ void Tool::Print(StringRef& reply)
 
 	reply.cat("; xmap:");
 	sep = ' ';
-	for (size_t xi = 0; xi < xmapCount; ++xi)
+	for (size_t xi = 0; xi < MAX_AXES; ++xi)
 	{
-		reply.catf("%c%c", sep, GCodes::axisLetters[xi]);
-		sep = ',';
+		if ((xMapping & (1u << xi)) != 0)
+		{
+			reply.catf("%c%c", sep, GCodes::axisLetters[xi]);
+			sep = ',';
+		}
 	}
 
 	reply.cat("; fans:");
@@ -173,7 +177,7 @@ float Tool::MaxFeedrate() const
 	const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
 	for (size_t d = 0; d < driveCount; d++)
 	{
-		float mf = reprap.GetPlatform()->MaxFeedrate(drives[d] + numAxes);
+		const float mf = reprap.GetPlatform()->MaxFeedrate(drives[d] + numAxes);
 		if (mf > result)
 		{
 			result = mf;
@@ -193,7 +197,7 @@ float Tool::InstantDv() const
 	const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
 	for (size_t d = 0; d < driveCount; d++)
 	{
-		float idv = reprap.GetPlatform()->ActualInstantDv(drives[d] + numAxes);
+		const float idv = reprap.GetPlatform()->ActualInstantDv(drives[d] + numAxes);
 		if (idv < result)
 		{
 			result = idv;
@@ -306,16 +310,23 @@ void Tool::SetVariables(const float* standby, const float* active)
 		}
 		else
 		{
-			const float temperatureLimit = reprap.GetPlatform()->GetTemperatureLimit();
+			const float temperatureLimit = reprap.GetHeat()->GetTemperatureLimit(heaters[heater]);
+			const Tool * const currentTool = reprap.GetCurrentTool();
 			if (active[heater] < temperatureLimit)
 			{
 				activeTemperatures[heater] = active[heater];
-				reprap.GetHeat()->SetActiveTemperature(heaters[heater], activeTemperatures[heater]);
+				if (currentTool == nullptr || currentTool == this)
+				{
+					reprap.GetHeat()->SetActiveTemperature(heaters[heater], activeTemperatures[heater]);
+				}
 			}
 			if (standby[heater] < temperatureLimit)
 			{
 				standbyTemperatures[heater] = standby[heater];
-				reprap.GetHeat()->SetStandbyTemperature(heaters[heater], standbyTemperatures[heater]);
+				if (currentTool == nullptr || currentTool == this)
+				{
+					reprap.GetHeat()->SetStandbyTemperature(heaters[heater], standbyTemperatures[heater]);
+				}
 			}
 		}
 	}

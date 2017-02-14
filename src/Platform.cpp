@@ -19,21 +19,27 @@
 
  ****************************************************************************************************/
 
-#include "RepRapFirmware.h"
-#include "DueFlashStorage.h"
-#include "RTCDue.h"
+#include "Platform.h"
+
+#include "Heating/Heat.h"
+#include "Movement/DDA.h"
+#include "Movement/Move.h"
+#include "Network.h"
+#include "RepRap.h"
+#include "Webserver.h"
+#include "Libraries/Math/Isqrt.h"
 
 #include "sam/drivers/tc/tc.h"
 #include "sam/drivers/hsmci/hsmci.h"
 #include "sd_mmc.h"
 
-#if defined(DUET_NG)
-# include "TMC2660.h"
-#endif
-
 #ifdef DUET_NG
+# include "TMC2660.h"
 # include "FirmwareUpdater.h"
 #endif
+
+#include <climits>
+#include <malloc.h>
 
 extern char _end;
 extern "C" char *sbrk(int i);
@@ -54,6 +60,12 @@ static volatile uint32_t fanInterval = 0;			// written by ISR, read outside the 
 
 const float minStepPulseTiming = 0.2;				// we assume that we always generate step high and low times at least this wide without special action
 
+const int Heater0LogicalPin = 0;
+const int Fan0LogicalPin = 20;
+const int EndstopXLogicalPin = 40;
+const int Special0LogicalPin = 60;
+const int DueX5Gpio0LogicalPin = 100;
+
 //#define MOVE_DEBUG
 
 #ifdef MOVE_DEBUG
@@ -64,6 +76,8 @@ uint32_t nextInterruptScheduledAt = 0;
 uint32_t lastInterruptTime = 0;
 #endif
 
+// Global functions
+
 // Urgent initialisation function
 // This is called before general init has been done, and before constructors for C++ static data have been called.
 // Therefore, be very careful what you do here!
@@ -71,7 +85,7 @@ void UrgentInit()
 {
 #ifdef DUET_NG
 	// When the reset button is pressed on pre-production Duet WiFi boards, if the TMC2660 drivers were previously enabled then we get
-	// uncommanded motor movements if the STEP lines pick up any noise. Try to reduce that by initialising the drivers early here.
+	// uncommanded motor movements if the STEP lines pick up any noise. Try to reduce that by initialising the pins that control the drivers early here.
 	// On the production boards the ENN line is pulled high and that prevents motor movements.
 	for (size_t drive = 0; drive < DRIVES; ++drive)
 	{
@@ -94,6 +108,20 @@ void setup()
 		*heapend++ = memPattern;
 	}
 
+	// Trap integer divide-by-zero.
+	// We could also trap unaligned memory access, if we change the gcc options to not generate code that uses unaligned memory access.
+	SCB->CCR |= SCB_CCR_DIV_0_TRP_Msk;
+
+	// When doing a software reset, we disable the NRST input (User reset) to prevent the negative-going pulse that gets generated on it
+	// being held in the capacitor and changing the reset reason form Software to User. So enable it again here. We hope that the reset signal
+	// will have gone away by now.
+#ifndef RSTC_MR_KEY_PASSWD
+// Definition of RSTC_MR_KEY_PASSWD is missing in the SAM3X ASF files
+# define RSTC_MR_KEY_PASSWD (0xA5u << 24)
+#endif
+	RSTC->RSTC_MR = RSTC_MR_KEY_PASSWD | RSTC_MR_URSTEN;	// ignore any signal on the NRST pin for now so that the reset reason will show as Software
+
+	// Go on and do the main initialisation
 	reprap.Init();
 }
 
@@ -110,40 +138,74 @@ extern "C"
 		reprap.Tick();
 		return 0;
 	}
+
+	// Exception handlers
+	// By default the Usage Fault, Bus Fault and Memory Management fault handlers are not enabled,
+	// so they escalate to a Hard Fault and we don't need to provide separate exception handlers for them.
+	// We can get information on what caused a Hard Fault form the status registers.
+	// Also get the program counter when the exception occurred.
+	void prvGetRegistersFromStack(const uint32_t *pulFaultStackAddress)
+	{
+	    reprap.GetPlatform()->SoftwareReset((uint16_t)SoftwareResetReason::hardFault, pulFaultStackAddress + 5);
+	}
+
+	// The fault handler implementation calls a function called prvGetRegistersFromStack()
+	void HardFault_Handler() __attribute__((naked));
+	void HardFault_Handler()
+	{
+	    __asm volatile
+	    (
+	        " tst lr, #4                                                \n"
+	        " ite eq                                                    \n"
+	        " mrseq r0, msp                                             \n"
+	        " mrsne r0, psp                                             \n"
+	        " ldr r1, [r0, #24]                                         \n"
+	        " ldr r2, handler2_address_const                            \n"
+	        " bx r2                                                     \n"
+	        " handler2_address_const: .word prvGetRegistersFromStack    \n"
+	    );
+	}
+
+	// We could set up the following fault handlers to retrieve the program counter in the same way as for a Hard Fault,
+	// however these exceptions are unlikely to occur, so for now we just report the exception type.
+	void NMI_Handler        () { reprap.GetPlatform()->SoftwareReset((uint16_t)SoftwareResetReason::NMI); }
+	void SVC_Handler		() { reprap.GetPlatform()->SoftwareReset((uint16_t)SoftwareResetReason::otherFault); }
+	void DebugMon_Handler   () { reprap.GetPlatform()->SoftwareReset((uint16_t)SoftwareResetReason::otherFault); }
+	void PendSV_Handler		() { reprap.GetPlatform()->SoftwareReset((uint16_t)SoftwareResetReason::otherFault); }
 }
 
-//*************************************************************************************************
-// PidParameters class
+// ZProbeParameters class
 
-bool PidParameters::UsePID() const
+void ZProbeParameters::Init(float h)
 {
-	return kP >= 0;
+	adcValue = Z_PROBE_AD_VALUE;
+	xOffset = yOffset = 0.0;
+	height = h;
+	calibTemperature = 20.0;
+	temperatureCoefficient = 0.0;	// no default temperature correction
+	diveHeight = DEFAULT_Z_DIVE;
+	probeSpeed = DEFAULT_PROBE_SPEED;
+	travelSpeed = DEFAULT_TRAVEL_SPEED;
+	recoveryTime = extraParam = 0.0;
+	invertReading = false;
 }
 
-float PidParameters::GetThermistorR25() const
+float ZProbeParameters::GetStopHeight(float temperature) const
 {
-	return thermistorInfR * exp(thermistorBeta / (25.0 - ABS_ZERO));
+	return ((temperature - calibTemperature) * temperatureCoefficient) + height;
 }
 
-void PidParameters::SetThermistorR25AndBeta(float r25, float beta)
+bool ZProbeParameters::WriteParameters(FileStore *f, unsigned int probeType) const
 {
-	thermistorInfR = r25 * exp(-beta / (25.0 - ABS_ZERO));
-	thermistorBeta = beta;
-}
-
-bool PidParameters::operator==(const PidParameters& other) const
-{
-	return kI == other.kI && kD == other.kD && kP == other.kP && kT == other.kT && kS == other.kS
-			&& thermistorBeta == other.thermistorBeta && thermistorInfR == other.thermistorInfR
-			&& thermistorSeriesR == other.thermistorSeriesR && adcLowOffset == other.adcLowOffset
-			&& adcHighOffset == other.adcHighOffset;
+	scratchString.printf("G31 T%u P%d X%.1f Y%.1f Z%.2f\n", probeType, adcValue, xOffset, yOffset, height);
+	return f->Write(scratchString.Pointer());
 }
 
 //*************************************************************************************************
 // Platform class
 
 Platform::Platform() :
-		autoSaveEnabled(false), board(DEFAULT_BOARD_TYPE), active(false), errorCodeBits(0),
+		board(DEFAULT_BOARD_TYPE), active(false), errorCodeBits(0),
 		auxGCodeReply(nullptr), fileStructureInitialised(false), tickState(0), debugCode(0)
 {
 	// Output
@@ -171,11 +233,9 @@ void Platform::Init()
 	SetBoardType(BoardType::Auto);
 
 	// Real-time clock
-
-	RTCDue::Init();
+	realTime = 0;
 
 	// Comms
-
 	baudRates[0] = MAIN_BAUD_RATE;
 	baudRates[1] = AUX_BAUD_RATE;
 #if NUM_SERIAL_CHANNELS >= 2
@@ -196,9 +256,20 @@ void Platform::Init()
 	SERIAL_AUX2_DEVICE.begin(baudRates[2]);
 #endif
 
-	static_assert(sizeof(FlashData) + sizeof(SoftwareResetData) <= FLASH_DATA_LENGTH, "NVData too large");
+	compatibility = marlin;						// default to Marlin because the common host programs expect the "OK" response to commands
+	ARRAY_INIT(ipAddress, DefaultIpAddress);
+	ARRAY_INIT(netMask, DefaultNetMask);
+	ARRAY_INIT(gateWay, DefaultGateway);
 
-	ResetNvData();
+#if defined(DUET_NG) && defined(DUET_WIFI)
+	memset(macAddress, 0xFF, sizeof(macAddress));
+#else
+	ARRAY_INIT(macAddress, DefaultMacAddress);
+#endif
+
+	zProbeType = 0;	// Default is to use no Z probe switch
+	zProbeAxes = Z_PROBE_AXES;
+	SetZProbeDefaults();
 
 	// We need to initialise at least some of the time stuff before we call MassStorage::Init()
 	addToTime = 0.0;
@@ -216,31 +287,20 @@ void Platform::Init()
 
 	fileStructureInitialised = true;
 
-#if !defined(DUET_NG)
+#if !defined(DUET_NG) && !defined(__RADDS__)
 	mcpDuet.begin();							// only call begin once in the entire execution, this begins the I2C comms on that channel for all objects
 	mcpExpansion.setMCP4461Address(0x2E);		// not required for mcpDuet, as this uses the default address
 #endif
 
-	// Directories
-
-	sysDir = SYS_DIR;
-	macroDir = MACRO_DIR;
-	webDir = WEB_DIR;
-	gcodeDir = GCODE_DIR;
-	configFile = CONFIG_FILE;
-	defaultFile = DEFAULT_FILE;
-
 	// DRIVES
-
-	ARRAY_INIT(directions, DIRECTIONS);
-	ARRAY_INIT(enableValues, ENABLE_VALUES);
 	ARRAY_INIT(endStopPins, END_STOP_PINS);
 	ARRAY_INIT(maxFeedrates, MAX_FEEDRATES);
 	ARRAY_INIT(accelerations, ACCELERATIONS);
 	ARRAY_INIT(driveStepsPerUnit, DRIVE_STEPS_PER_UNIT);
 	ARRAY_INIT(instantDvs, INSTANT_DVS);
 
-#if !defined(DUET_NG)
+#if !defined(DUET_NG) && !defined(__RADDS__)
+	// Motor current setting on Duet 0.6 and 0.8.5
 	ARRAY_INIT(potWipes, POT_WIPES);
 	senseResistor = SENSE_RESISTOR;
 	maxStepperDigipotVoltage = MAX_STEPPER_DIGIPOT_VOLTAGE;
@@ -248,36 +308,18 @@ void Platform::Init()
 	stepperDacVoltageOffset = STEPPER_DAC_VOLTAGE_OFFSET;
 #endif
 
-	maxAverageAcceleration = 10000.0;			// high enough to have no effect until it is changed
-
 	// Z PROBE
-
 	zProbePin = Z_PROBE_PIN;
 	zProbeAdcChannel = PinToAdcChannel(zProbePin);
 	InitZProbe();		// this also sets up zProbeModulationPin
 
 	// AXES
-
 	ARRAY_INIT(axisMaxima, AXIS_MAXIMA);
 	ARRAY_INIT(axisMinima, AXIS_MINIMA);
 
 	idleCurrentFactor = DEFAULT_IDLE_CURRENT_FACTOR;
 
-	// HEATERS - Bed is assumed to be the first
-
-	ARRAY_INIT(tempSensePins, TEMP_SENSE_PINS);
-	ARRAY_INIT(heatOnPins, HEAT_ON_PINS);
-	ARRAY_INIT(spiTempSenseCsPins, SpiTempSensorCsPins);
-
-	configuredHeaters = (BED_HEATER >= 0) ? (1 << BED_HEATER) : 0;
-	heatSampleTicks = HEAT_SAMPLE_TIME * SecondsToMillis;
-
-	// Enable pullups on all the SPI CS pins. This is required if we are using more than one device on the SPI bus.
-	// Otherwise, when we try to initialise the first device, the other devices may respond as well because their CS lines are not high.
-	for (size_t i = 0; i < MaxSpiTempSensors; ++i)
-	{
-		setPullup(SpiTempSensorCsPins[i], true);
-	}
+	// SD card interfaces
 	for (size_t i = 0; i < NumSdCards; ++i)
 	{
 		const Pin p = SdCardDetectPins[i];
@@ -296,6 +338,9 @@ void Platform::Init()
 
 	for (size_t drive = 0; drive < DRIVES; drive++)
 	{
+		enableValues[drive] = false;				// assume active low enable signal
+		directions[drive] = true;					// drive moves forwards by default
+
 		// Map axes and extruders straight through
 		if (drive < MAX_AXES)
 		{
@@ -339,8 +384,8 @@ void Platform::Init()
 	// Test for presence of a DueX2 or DueX5 expansion board and work out how many TMC2660 drivers we have
 	// The SX1509B has an independent power on reset, so give it some time
 	delay(200);
-	ExpansionBoardType et = DuetExpansion::Init();
-	switch (et)
+	expansionBoard = DuetExpansion::Init();
+	switch (expansionBoard)
 	{
 	case ExpansionBoardType::DueX2:
 		numTMC2660Drivers = 7;
@@ -355,14 +400,36 @@ void Platform::Init()
 		break;
 	}
 
-	// Initialise TMC2660 drivers
+	// Initialise TMC2660 driver module
 	driversPowered = false;
 	TMC2660::Init(ENABLE_PINS, numTMC2660Drivers);
 #endif
 
-	extrusionAncilliaryPWM = 0.0;
+	// Allow extrusion ancilliary PWM to use FAN0 even if FAN0 has not been disabled, for backwards compatibility
+	extrusionAncilliaryPwmValue = 0.0;
+	extrusionAncilliaryPwmFrequency = DefaultPinWritePwmFreq;
+	extrusionAncilliaryPwmLogicalPin = Fan0LogicalPin;
+	extrusionAncilliaryPwmFirmwarePin = COOLING_FAN_PINS[0];
+	extrusionAncilliaryPwmInvert =
+#if defined(DUET_NG) || defined(__RADDS__)
+			false;
+#else
+			(board == BoardType::Duet_06 || board == BoardType::Duet_07);
+#endif
+	ARRAY_INIT(tempSensePins, TEMP_SENSE_PINS);
+	ARRAY_INIT(heatOnPins, HEAT_ON_PINS);
+	ARRAY_INIT(spiTempSenseCsPins, SpiTempSensorCsPins);
 
-	// HEATERS - Bed is assumed to be index 0
+	configuredHeaters = (DefaultBedHeater >= 0) ? (1 << DefaultBedHeater) : 0;
+	heatSampleTicks = HEAT_SAMPLE_TIME * SecondsToMillis;
+
+	// Enable pullups on all the SPI CS pins. This is required if we are using more than one device on the SPI bus.
+	// Otherwise, when we try to initialise the first device, the other devices may respond as well because their CS lines are not high.
+	for (size_t i = 0; i < MaxSpiTempSensors; ++i)
+	{
+		setPullup(SpiTempSensorCsPins[i], true);
+	}
+
 	for (size_t heater = 0; heater < HEATERS; heater++)
 	{
 		if (heatOnPins[heater] != NoPin)
@@ -374,11 +441,16 @@ void Platform::Init()
 		thermistorAdcChannels[heater] = chan;
 		AnalogInEnableChannel(chan, true);
 
-		SetThermistorNumber(heater, heater);					// map the thermistor straight through
+		SetThermistorNumber(heater, heater);								// map the thermistor straight through
+		thermistors[heater].SetParameters(
+				(heater == DefaultBedHeater) ? BED_R25 : EXT_R25,
+				(heater == DefaultBedHeater) ? BED_BETA : EXT_BETA,
+				(heater == DefaultBedHeater) ? BED_SHC : EXT_SHC,
+				THERMISTOR_SERIES_RS);										// initialise the thermistor parameters
 		thermistorFilters[heater].Init(0);
 	}
-	SetTemperatureLimit(DEFAULT_TEMPERATURE_LIMIT);
 
+	// Fans
 	InitFans();
 
 	// Hotend configuration
@@ -411,15 +483,18 @@ void Platform::Init()
 	}
 #endif
 
-	// MCU temperature and power monitoring
+	// MCU temperature monitoring - doesn't work in RADDS due to pin assignmentgs and SAM3X chip bug
+#ifndef __RADDS__
 	temperatureAdcChannel = GetTemperatureAdcChannel();
 	AnalogInEnableChannel(temperatureAdcChannel, true);
 	currentMcuTemperature = highestMcuTemperature = 0;
 	lowestMcuTemperature = 4095;
-	mcuTemperatureAdjust = 0.0;
 	mcuAlarmTemperature = 80.0;			// need to set the quite high here because the sensor is not be calibrated yet
+#endif
+	mcuTemperatureAdjust = 0.0;
 
 #ifdef DUET_NG
+	// Power monitoring
 	vInMonitorAdcChannel = PinToAdcChannel(PowerMonitorVinDetectPin);
 	pinMode(PowerMonitorVinDetectPin, AIN);
 	AnalogInEnableChannel(vInMonitorAdcChannel, true);
@@ -457,23 +532,8 @@ bool Platform::AnyFileOpen(const FATFS *fs) const
 	return false;
 }
 
-void Platform::SetTemperatureLimit(float t)
-{
-	temperatureLimit = t;
-	for (size_t heater = 0; heater < HEATERS; heater++)
-	{
-		// Calculate and store the ADC average sum that corresponds to an overheat condition, so that we can check it quickly in the tick ISR
-		float thermistorOverheatResistance = nvData.pidParams[heater].GetRInf()
-				* exp(-nvData.pidParams[heater].GetBeta() / (temperatureLimit - ABS_ZERO));
-		float thermistorOverheatAdcValue = (AD_RANGE_REAL + 1) * thermistorOverheatResistance
-				/ (thermistorOverheatResistance + nvData.pidParams[heater].thermistorSeriesR);
-		thermistorOverheatSums[heater] = (uint32_t) (thermistorOverheatAdcValue + 0.9) * THERMISTOR_AVERAGE_READINGS;
-	}
-}
-
 // Specify which thermistor channel a particular heater uses
 void Platform::SetThermistorNumber(size_t heater, size_t thermistor)
-pre(heater < HEATERS && thermistor < HEATERS)
 {
 	heaterTempChannels[heater] = thermistor;
 
@@ -495,6 +555,13 @@ int Platform::GetThermistorNumber(size_t heater) const
 	return heaterTempChannels[heater];
 }
 
+void Platform::SetZProbeDefaults()
+{
+	switchZProbeParameters.Init(0.0);
+	irZProbeParameters.Init(Z_PROBE_STOP_HEIGHT);
+	alternateZProbeParameters.Init(Z_PROBE_STOP_HEIGHT);
+}
+
 void Platform::InitZProbe()
 {
 	zProbeOnFilter.Init(0);
@@ -506,7 +573,7 @@ void Platform::InitZProbe()
 	zProbeModulationPin = (board == BoardType::Duet_07 || board == BoardType::Duet_085) ? Z_PROBE_MOD_PIN07 : Z_PROBE_MOD_PIN;
 #endif
 
-	switch (nvData.zProbeType)
+	switch (zProbeType)
 	{
 	case 1:
 	case 2:
@@ -525,35 +592,39 @@ void Platform::InitZProbe()
 		AnalogInEnableChannel(zProbeAdcChannel, false);
 		pinMode(zProbePin, INPUT_PULLUP);
 		pinMode(endStopPins[E0_AXIS], INPUT_PULLUP);
+		pinMode(zProbeModulationPin, OUTPUT_LOW);		// we now set the modulation output high during probing only when using probe types 4 and higher
 		break;
 
 	case 5:
 	default:
 		AnalogInEnableChannel(zProbeAdcChannel, false);
 		pinMode(zProbePin, INPUT_PULLUP);
+		pinMode(zProbeModulationPin, OUTPUT_LOW);		// we now set the modulation output high during probing only when using probe types 4 and higher
 		break;
 
 	case 6:
 		AnalogInEnableChannel(zProbeAdcChannel, false);
 		pinMode(zProbePin, INPUT_PULLUP);
 		pinMode(endStopPins[E0_AXIS + 1], INPUT_PULLUP);
+		pinMode(zProbeModulationPin, OUTPUT_LOW);		// we now set the modulation output high during probing only when using probe types 4 and higher
 		break;
 
 	case 7:
 		AnalogInEnableChannel(zProbeAdcChannel, false);
 		pinMode(zProbePin, INPUT_PULLUP);
+		pinMode(zProbeModulationPin, OUTPUT_LOW);		// we now set the modulation output high during probing only when using probe types 4 and higher
 		break;	//TODO (DeltaProbe)
 	}
 }
 
 // Return the Z probe data.
 // The ADC readings are 12 bits, so we convert them to 10-bit readings for compatibility with the old firmware.
-int Platform::ZProbe() const
+int Platform::GetZProbeReading() const
 {
 	int zProbeVal = 0;			// initialised to avoid spurious compiler warning
 	if (zProbeOnFilter.IsValid() && zProbeOffFilter.IsValid())
 	{
-		switch (nvData.zProbeType)
+		switch (zProbeType)
 		{
 		case 1:		// Simple or intelligent IR sensor
 		case 3:		// Alternate sensor
@@ -578,7 +649,7 @@ int Platform::ZProbe() const
 		}
 	}
 
-	return (GetZProbeParameters().invertReading) ? 1023 - zProbeVal : zProbeVal;
+	return (GetCurrentZProbeParameters().invertReading) ? 1000 - zProbeVal : zProbeVal;
 }
 
 // Return the Z probe secondary values.
@@ -586,7 +657,7 @@ int Platform::GetZProbeSecondaryValues(int& v1, int& v2)
 {
 	if (zProbeOnFilter.IsValid() && zProbeOffFilter.IsValid())
 	{
-		switch (nvData.zProbeType)
+		switch (zProbeType)
 		{
 		case 2:		// modulated IR sensor
 			v1 = (int) (zProbeOnFilter.GetSum() / (4 * Z_PROBE_AVERAGE_READINGS));	// pass back the reading with IR turned on
@@ -598,18 +669,9 @@ int Platform::GetZProbeSecondaryValues(int& v1, int& v2)
 	return 0;
 }
 
-int Platform::GetZProbeType() const
-{
-	return nvData.zProbeType;
-}
-
 void Platform::SetZProbeAxes(uint32_t axes)
 {
-	nvData.zProbeAxes = axes;
-	if (autoSaveEnabled)
-	{
-		WriteNvData();
-	}
+	zProbeAxes = axes;
 }
 
 // Get our best estimate of the Z probe temperature
@@ -630,157 +692,95 @@ float Platform::GetZProbeTemperature()
 
 float Platform::ZProbeStopHeight()
 {
-	return GetZProbeParameters().GetStopHeight(GetZProbeTemperature());
+	return GetCurrentZProbeParameters().GetStopHeight(GetZProbeTemperature());
 }
 
 float Platform::GetZProbeDiveHeight() const
 {
-	return GetZProbeParameters().diveHeight;
+	return GetCurrentZProbeParameters().diveHeight;
+}
+
+float Platform::GetZProbeStartingHeight()
+{
+	const ZProbeParameters& params = GetCurrentZProbeParameters();
+	return params.diveHeight + max<float>(params.GetStopHeight(GetZProbeTemperature()), 0.0);
 }
 
 float Platform::GetZProbeTravelSpeed() const
 {
-	return GetZProbeParameters().travelSpeed;
+	return GetCurrentZProbeParameters().travelSpeed;
 }
 
 void Platform::SetZProbeType(int pt)
 {
-	int newZProbeType = (pt >= 0 && pt <= 7) ? pt : 0;
-	if (newZProbeType != nvData.zProbeType)
-	{
-		nvData.zProbeType = newZProbeType;
-		if (autoSaveEnabled)
-		{
-			WriteNvData();
-		}
-	}
+	zProbeType = (pt >= 0 && pt <= 7) ? pt : 0;
 	InitZProbe();
 }
 
-const ZProbeParameters& Platform::GetZProbeParameters() const
+void Platform::SetProbing(bool isProbing)
 {
-	switch (nvData.zProbeType)
+	if (zProbeType > 3)
 	{
-	case 1:
-	case 2:
-		return nvData.irZProbeParameters;
-	case 3:
-	case 7:
-		return nvData.alternateZProbeParameters;
-	case 4:
-	case 5:
-	case 6:
-	default:
-		return nvData.switchZProbeParameters;
+		// For Z probe types other than 1/2/3 we set the modulation pin high at the start of a probing move and low at the end
+		digitalWrite(zProbeModulationPin, isProbing);
 	}
 }
 
-void Platform::SetZProbeParameters(const struct ZProbeParameters& params)
+const ZProbeParameters& Platform::GetZProbeParameters(int32_t probeType) const
 {
-	if (GetZProbeParameters() != params)
+	switch (probeType)
 	{
-		switch (nvData.zProbeType)
-		{
-		case 1:
-		case 2:
-			nvData.irZProbeParameters = params;
-			break;
-
-		case 3:
-		case 7:
-			nvData.alternateZProbeParameters = params;
-			break;
-
-		case 4:
-		case 5:
-		case 6:
-		default:
-			nvData.switchZProbeParameters = params;
-			break;
-		}
-
-		if (autoSaveEnabled)
-		{
-			WriteNvData();
-		}
+	case 1:
+	case 2:
+	case 5:
+		return irZProbeParameters;
+	case 3:
+	case 7:
+		return alternateZProbeParameters;
+	case 4:
+	case 6:
+	default:
+		return switchZProbeParameters;
 	}
+}
+
+void Platform::SetZProbeParameters(int32_t probeType, const ZProbeParameters& params)
+{
+	switch (probeType)
+	{
+	case 1:
+	case 2:
+	case 5:
+		irZProbeParameters = params;
+		break;
+
+	case 3:
+	case 7:
+		alternateZProbeParameters = params;
+		break;
+
+	case 4:
+	case 6:
+	default:
+		switchZProbeParameters = params;
+		break;
+	}
+}
+
+// Return true if the specified point is accessible to the Z probe
+bool Platform::IsAccessibleProbePoint(float x, float y) const
+{
+	x -= GetCurrentZProbeParameters().xOffset;
+	y -= GetCurrentZProbeParameters().yOffset;
+	return (reprap.GetMove()->IsDeltaMode())
+			? x * x + y * y < reprap.GetMove()->GetDeltaParams().GetPrintRadiusSquared()
+			: x >= axisMinima[X_AXIS] && y >= axisMinima[Y_AXIS] && x <= axisMaxima[X_AXIS] && y <= axisMaxima[Y_AXIS];
 }
 
 // Return true if we must home X and Y before we home Z (i.e. we are using a bed probe)
 bool Platform::MustHomeXYBeforeZ() const
 {
-	return (nvData.zProbeType != 0) && ((nvData.zProbeAxes & (1 << Z_AXIS)) != 0);
-}
-
-void Platform::ResetNvData()
-{
-	nvData.compatibility = marlin;				// default to Marlin because the common host programs expect the "OK" response to commands
-	ARRAY_INIT(nvData.ipAddress, IP_ADDRESS);
-	ARRAY_INIT(nvData.netMask, NET_MASK);
-	ARRAY_INIT(nvData.gateWay, GATE_WAY);
-
-#ifdef DUET_NG
-	memset(nvData.macAddress, 0xFF, sizeof(nvData.macAddress));
-#else
-	ARRAY_INIT(nvData.macAddress, MAC_ADDRESS);
-#endif
-
-	nvData.zProbeType = 0;	// Default is to use no Z probe switch
-	nvData.zProbeAxes = Z_PROBE_AXES;
-	nvData.switchZProbeParameters.Init(0.0);
-	nvData.irZProbeParameters.Init(Z_PROBE_STOP_HEIGHT);
-	nvData.alternateZProbeParameters.Init(Z_PROBE_STOP_HEIGHT);
-
-	for (size_t i = 0; i < HEATERS; ++i)
-	{
-		PidParameters& pp = nvData.pidParams[i];
-		pp.thermistorSeriesR = defaultThermistorSeriesRs[i];
-		pp.SetThermistorR25AndBeta(defaultThermistor25RS[i], defaultThermistorBetas[i]);
-		pp.kI = defaultPidKis[i];
-		pp.kD = defaultPidKds[i];
-		pp.kP = defaultPidKps[i];
-		pp.kT = defaultPidKts[i];
-		pp.kS = defaultPidKss[i];
-		pp.adcLowOffset = pp.adcHighOffset = 0.0;
-	}
-
-#if FLASH_SAVE_ENABLED
-	nvData.magic = FlashData::magicValue;
-	nvData.version = FlashData::versionValue;
-#endif
-}
-
-void Platform::ReadNvData()
-{
-#if FLASH_SAVE_ENABLED
-	DueFlashStorage::read(FlashData::nvAddress, &nvData, sizeof(nvData));
-	if (nvData.magic != FlashData::magicValue || nvData.version != FlashData::versionValue)
-	{
-		// Nonvolatile data has not been initialized since the firmware was last written, so set up default values
-		ResetNvData();
-		// No point in writing it back here
-	}
-#else
-	Message(BOTH_ERROR_MESSAGE, "Cannot load non-volatile data, because Flash support has been disabled!\n");
-#endif
-}
-
-void Platform::WriteNvData()
-{
-#if FLASH_SAVE_ENABLED
-	DueFlashStorage::write(FlashData::nvAddress, &nvData, sizeof(nvData));
-#else
-	Message(BOTH_ERROR_MESSAGE, "Cannot write non-volatile data, because Flash support has been disabled!\n");
-#endif
-}
-
-void Platform::SetAutoSave(bool enabled)
-{
-#if FLASH_SAVE_ENABLED
-	autoSaveEnabled = enabled;
-#else
-	Message(BOTH_ERROR_MESSAGE, "Cannot enable auto-save, because Flash support has been disabled!\n");
-#endif
+	return (zProbeType != 0) && ((zProbeAxes & (1 << Z_AXIS)) != 0);
 }
 
 // Check the prerequisites for updating the main firmware. Return True if satisfied, else print as message and return false.
@@ -1028,7 +1028,7 @@ void Platform::Exit()
 
 Compatibility Platform::Emulating() const
 {
-	return (nvData.compatibility == reprapFirmware) ? me : nvData.compatibility;
+	return (compatibility == reprapFirmware) ? me : compatibility;
 }
 
 void Platform::SetEmulating(Compatibility c)
@@ -1042,46 +1042,30 @@ void Platform::SetEmulating(Compatibility c)
 	{
 		c = me;
 	}
-	if (c != nvData.compatibility)
-	{
-		nvData.compatibility = c;
-		if (autoSaveEnabled)
-		{
-			WriteNvData();
-		}
-	}
+	compatibility = c;
 }
 
 void Platform::UpdateNetworkAddress(byte dst[4], const byte src[4])
 {
-	bool changed = false;
 	for (uint8_t i = 0; i < 4; i++)
 	{
-		if (dst[i] != src[i])
-		{
-			dst[i] = src[i];
-			changed = true;
-		}
-	}
-	if (changed && autoSaveEnabled)
-	{
-		WriteNvData();
+		dst[i] = src[i];
 	}
 }
 
 void Platform::SetIPAddress(byte ip[])
 {
-	UpdateNetworkAddress(nvData.ipAddress, ip);
+	UpdateNetworkAddress(ipAddress, ip);
 }
 
 void Platform::SetGateWay(byte gw[])
 {
-	UpdateNetworkAddress(nvData.gateWay, gw);
+	UpdateNetworkAddress(gateWay, gw);
 }
 
 void Platform::SetNetMask(byte nm[])
 {
-	UpdateNetworkAddress(nvData.netMask, nm);
+	UpdateNetworkAddress(netMask, nm);
 }
 
 // Flush messages to USB and aux, returning true if there is more to send
@@ -1182,6 +1166,7 @@ void Platform::Spin()
 	}
 
 	// Check the MCU max and min temperatures
+#ifndef __RADDS__
 	if (currentMcuTemperature > highestMcuTemperature)
 	{
 		highestMcuTemperature= currentMcuTemperature;
@@ -1190,6 +1175,7 @@ void Platform::Spin()
 	{
 		lowestMcuTemperature = currentMcuTemperature;
 	}
+#endif
 
 	// Diagnostics test
 	if (debugCode == (int)DiagnosticTestType::TestSpinLockup)
@@ -1220,11 +1206,23 @@ void Platform::Spin()
 	TMC2660::SetDriversPowered(driversPowered);
 #endif
 
+	// Update the time
+	if (realTime != 0)
+	{
+		if (millis() - timeLastUpdatedMillis >= 1000)
+		{
+			++realTime;							// this assumes that time_t is a seconds-since-epoch counter, which is not guaranteed by the C standard
+			timeLastUpdatedMillis += 1000;
+		}
+	}
+
 	ClassReport(longWait);
 }
 
-void Platform::SoftwareReset(uint16_t reason)
+// Perform a software reset. 'stk' points to the program counter on the stack if the cause is an exception, otherwise it is nullptr.
+void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 {
+	wdt_restart(WDT);							// kick the watchdog
 	if (reason == (uint16_t)SoftwareResetReason::erase)
 	{
 		EraseAndReset();
@@ -1253,22 +1251,61 @@ void Platform::SoftwareReset(uint16_t reason)
 		reason |= (uint16_t)reprap.GetSpinningModule();
 
 		// Record the reason for the software reset
-		SoftwareResetData temp;
-		temp.magic = SoftwareResetData::magicValue;
-		temp.version = SoftwareResetData::versionValue;
-		temp.resetReason = reason;
-		GetStackUsage(NULL, NULL, &temp.neverUsedRam);
+		// First find a free slot (wear levelling)
+		size_t slot = SoftwareResetData::numberOfSlots;
+		SoftwareResetData srdBuf[SoftwareResetData::numberOfSlots];
 
-		// Save diagnostics data to Flash and reset the software
-		DueFlashStorage::write(SoftwareResetData::nvAddress, &temp, sizeof(SoftwareResetData));
+#ifdef DUET_NG
+		if (flash_read_user_signature(reinterpret_cast<uint32_t*>(srdBuf), sizeof(srdBuf)/sizeof(uint32_t)) == FLASH_RC_OK)
+#else
+		DueFlashStorage::read(SoftwareResetData::nvAddress, srdBuf, sizeof(srdBuf));
+#endif
+		{
+			while (slot != 0 && srdBuf[slot - 1].isVacant())
+			{
+				--slot;
+			}
+		}
+
+		if (slot == SoftwareResetData::numberOfSlots)
+		{
+			// No free slots, so erase the area
+#ifdef DUET_NG
+			flash_erase_user_signature();
+#endif
+			memset(srdBuf, 0xFF, sizeof(srdBuf));
+			slot = 0;
+		}
+		srdBuf[slot].magic = SoftwareResetData::magicValue;
+		srdBuf[slot].resetReason = reason;
+		GetStackUsage(nullptr, nullptr, &srdBuf[slot].neverUsedRam);
+		srdBuf[slot].hfsr = SCB->HFSR;
+		srdBuf[slot].cfsr = SCB->CFSR;
+		srdBuf[slot].icsr = SCB->ICSR;
+		srdBuf[slot].bfar = SCB->BFAR;
+		if (stk != nullptr)
+		{
+			srdBuf[slot].sp = reinterpret_cast<uint32_t>(stk);
+			for (size_t i = 0; i < ARRAY_SIZE(srdBuf[slot].stack); ++i)
+			{
+				srdBuf[slot].stack[i] = stk[i];
+			}
+		}
+
+		// Save diagnostics data to Flash
+#ifdef DUET_NG
+		flash_write_user_signature(srdBuf, sizeof(srdBuf)/sizeof(uint32_t));
+#else
+		DueFlashStorage::write(SoftwareResetData::nvAddress, srdBuf, sizeof(srdBuf));
+#endif
 	}
+
+	RSTC->RSTC_MR = RSTC_MR_KEY_PASSWD;			// ignore any signal on the NRST pin for now so that the reset reason will show as Software
 	Reset();
 	for(;;) {}
 }
 
-
 //*****************************************************************************************************************
-
 // Interrupts
 
 #ifndef DUET_NG
@@ -1304,10 +1341,10 @@ void Platform::InitialiseInterrupts()
 
 	// Timer interrupt for stepper motors
 	// The clock rate we use is a compromise. Too fast and the 64-bit square roots take a long time to execute. Too slow and we lose resolution.
-	// We choose a clock divisor of 32, which gives us 0.38us resolution. The next option is 128 which would give 1.524us resolution.
+	// We choose a clock divisor of 128 which gives 1.524us resolution on the Duet 085 (84MHz clock) and 0.9375us resolution on the Duet WiFi.
 	pmc_set_writeprotect(false);
 	pmc_enable_periph_clk((uint32_t) STEP_TC_IRQN);
-	tc_init(STEP_TC, STEP_TC_CHAN, TC_CMR_WAVE | TC_CMR_WAVSEL_UP | TC_CMR_TCCLKS_TIMER_CLOCK3);
+	tc_init(STEP_TC, STEP_TC_CHAN, TC_CMR_WAVE | TC_CMR_WAVSEL_UP | TC_CMR_TCCLKS_TIMER_CLOCK4);
 	STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_IDR = ~(uint32_t)0; // interrupts disabled for now
 	tc_start(STEP_TC, STEP_TC_CHAN);
 	tc_get_status(STEP_TC, STEP_TC_CHAN);					// clear any pending interrupt
@@ -1375,41 +1412,72 @@ void Platform::Diagnostics(MessageType mtype)
 	MessageF(mtype, "Program static ram used: %d\n", &_end - ramstart);
 	MessageF(mtype, "Dynamic ram used: %d\n", mi.uordblks);
 	MessageF(mtype, "Recycled dynamic ram: %d\n", mi.fordblks);
-	size_t currentStack, maxStack, neverUsed;
+	uint32_t currentStack, maxStack, neverUsed;
 	GetStackUsage(&currentStack, &maxStack, &neverUsed);
-	MessageF(mtype, "Current stack ram used: %d\n", currentStack);
-	MessageF(mtype, "Maximum stack ram used: %d\n", maxStack);
-	MessageF(mtype, "Never used ram: %d\n", neverUsed);
+	MessageF(mtype, "Current stack ram used: %u\n", currentStack);
+	MessageF(mtype, "Maximum stack ram used: %u\n", maxStack);
+	MessageF(mtype, "Never used ram: %u\n", neverUsed);
 
 	// Show the up time and reason for the last reset
 	const uint32_t now = (uint32_t)Time();		// get up time in seconds
-	const char* resetReasons[8] = { "power up", "backup", "watchdog", "software", "external", "?", "?", "?" };
+	const char* resetReasons[8] = { "power up", "backup", "watchdog", "software",
+#ifdef DUET_NG
+	// On the SAM4E a watchdog reset may be reported as a user reset because of the capacitor on the NRST pin
+									"reset button or watchdog",
+#else
+									"reset button",
+#endif
+									"?", "?", "?" };
 	MessageF(mtype, "Last reset %02d:%02d:%02d ago, cause: %s\n",
 			(unsigned int)(now/3600), (unsigned int)((now % 3600)/60), (unsigned int)(now % 60),
 			resetReasons[(REG_RSTC_SR & RSTC_SR_RSTTYP_Msk) >> RSTC_SR_RSTTYP_Pos]);
 
-	// Show the error code stored at the last software reset
+	// Show the reset code stored at the last software reset
 	{
-		SoftwareResetData temp;
-		temp.magic = 0;
-		DueFlashStorage::read(SoftwareResetData::nvAddress, &temp, sizeof(SoftwareResetData));
-		if (temp.magic == SoftwareResetData::magicValue && temp.version == SoftwareResetData::versionValue)
+		SoftwareResetData srdBuf[SoftwareResetData::numberOfSlots];
+		memset(srdBuf, 0, sizeof(srdBuf));
+		int slot = -1;
+
+#ifdef DUET_NG
+		if (flash_read_user_signature(reinterpret_cast<uint32_t*>(srdBuf), sizeof(srdBuf)/sizeof(uint32_t)) == FLASH_RC_OK)
+#else
+		DueFlashStorage::read(SoftwareResetData::nvAddress, srdBuf, sizeof(srdBuf));
+#endif
 		{
-			MessageF(mtype, "Last software reset code & available RAM: 0x%04x, %u\n", temp.resetReason, temp.neverUsedRam);
-			MessageF(mtype, "Spinning module during software reset: %s\n", moduleName[temp.resetReason & 0x0F]);
+			// Find the last slot written
+			slot = SoftwareResetData::numberOfSlots - 1;
+			while (slot >= 0 && srdBuf[slot].magic == 0xFFFF)
+			{
+				--slot;
+			}
+		}
+
+		Message(mtype, "Last software reset code ");
+		if (slot >= 0 && srdBuf[slot].magic == SoftwareResetData::magicValue)
+		{
+			scratchString.Clear();
+			for (size_t i = 0; i < ARRAY_SIZE(srdBuf[slot].stack); ++i)
+			{
+				scratchString.catf(" %08x", srdBuf[slot].stack[i]);
+			}
+			MessageF(mtype, "0x%04x, HFSR 0x%08x, CFSR 0x%08x, ICSR 0x%08x, BFAR 0x%08x, SP 0x%08x\nStack:%s\n",
+					srdBuf[slot].resetReason, srdBuf[slot].hfsr, srdBuf[slot].cfsr, srdBuf[slot].icsr, srdBuf[slot].bfar, srdBuf[slot].sp, scratchString.Pointer());
+			MessageF(mtype, "Spinning module during software reset: %s, available RAM %u bytes (slot %d)\n",
+					moduleName[srdBuf[slot].resetReason & 0x0F], srdBuf[slot].neverUsedRam, slot);
+		}
+		else
+		{
+			Message(mtype, "not available\n");
 		}
 	}
 
 	// Show the current error codes
 	MessageF(mtype, "Error status: %u\n", errorCodeBits);
 
-	// Show the current probe position heights
-	Message(mtype, "Bed probe heights:");
-	for (size_t i = 0; i < MAX_PROBE_POINTS; ++i)
-	{
-		MessageF(mtype, " %.3f", reprap.GetMove()->ZBedProbePoint(i));
-	}
-	Message(mtype, "\n");
+	//***TEMPORARY show the maximum PWM loop count, which should never exceed 1
+	extern uint32_t maxPwmLoopCount;
+	MessageF(mtype, "Max PWM loop count %u\n", maxPwmLoopCount);
+	maxPwmLoopCount = 0;
 
 	// Show the number of free entries in the file table
 	unsigned int numFreeFiles = 0;
@@ -1423,15 +1491,21 @@ void Platform::Diagnostics(MessageType mtype)
 	MessageF(mtype, "Free file entries: %u\n", numFreeFiles);
 
 	// Show the HSMCI CD pin and speed
+#ifdef __RADDS__
+	MessageF(mtype, "SD card 0 %s\n", (sd_mmc_card_detected(0) ? "detected" : "not detected"));
+#else
 	MessageF(mtype, "SD card 0 %s, interface speed: %.1fMBytes/sec\n", (sd_mmc_card_detected(0) ? "detected" : "not detected"), (float)hsmci_get_speed()/1000000.0);
+#endif
 
 	// Show the longest SD card write time
 	MessageF(mtype, "SD card longest block write time: %.1fms\n", FileStore::GetAndClearLongestWriteTime());
 
+#ifndef __RADDS__
 	// Show the MCU temperatures
 	MessageF(mtype, "MCU temperature: min %.1f, current %.1f, max %.1f\n",
 				AdcReadingToCpuTemperature(lowestMcuTemperature), AdcReadingToCpuTemperature(currentMcuTemperature), AdcReadingToCpuTemperature(highestMcuTemperature));
 	lowestMcuTemperature = highestMcuTemperature = currentMcuTemperature;
+#endif
 
 #ifdef DUET_NG
 	// Show the supply voltage
@@ -1439,14 +1513,44 @@ void Platform::Diagnostics(MessageType mtype)
 				AdcReadingToPowerVoltage(lowestVin), AdcReadingToPowerVoltage(currentVin), AdcReadingToPowerVoltage(highestVin),
 				numUnderVoltageEvents, numOverVoltageEvents);
 	lowestVin = highestVin = currentVin;
+
+	// Show the motor stall status
+	if (expansionBoard == ExpansionBoardType::DueX2 || expansionBoard == ExpansionBoardType::DueX5)
+	{
+		const bool stalled = digitalRead(DueX_SG);
+		MessageF(mtype, "Expansion motor(s) stall indication: %s\n", (stalled) ? "yes" : "no");
+	}
+
+	for (size_t drive = 0; drive < numTMC2660Drivers; ++drive)
+	{
+		const uint32_t stat = TMC2660::GetStatus(drive);
+		MessageF(mtype, "Driver %d:%s%s%s%s%s%s\n", drive,
+						(stat & TMC_RR_SG) ? " stalled" : "",
+						(stat & TMC_RR_OT) ? " temperature-shutdown!"
+							: (stat & TMC_RR_OTPW) ? " temperature-warning" : "",
+						(stat & TMC_RR_S2G) ? " short-to-ground" : "",
+						((stat & TMC_RR_OLA) && !(stat & TMC_RR_STST)) ? " open-load-A" : "",
+						((stat & TMC_RR_OLB) && !(stat & TMC_RR_STST)) ? " open-load-B" : "",
+						(stat & TMC_RR_STST) ? " standstill"
+							: (stat & (TMC_RR_SG | TMC_RR_OT | TMC_RR_OTPW | TMC_RR_S2G | TMC_RR_OLA | TMC_RR_OLB))
+							  ? "" : " ok"
+				);
+	}
 #endif
 
 	// Show current RTC time
-	const time_t timeNow = RTCDue::GetDateTime();
-	const struct tm * const timeInfo = localtime(&timeNow);
-	MessageF(mtype, "Current date and time: %04u-%02u-%02u %02u:%02u:%02u\n",
-			timeInfo->tm_year + 1900, timeInfo->tm_mon + 1, timeInfo->tm_mday,
-			timeInfo->tm_hour, timeInfo->tm_min, timeInfo->tm_sec);
+	Message(mtype, "Current date and time: ");
+	struct tm timeInfo;
+	if (gmtime_r(&realTime, &timeInfo) != nullptr)
+	{
+		MessageF(mtype, "%04u-%02u-%02u %02u:%02u:%02u\n",
+				timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+				timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+	}
+	else
+	{
+		Message(mtype, "clock not set\n");
+	}
 
 // Debug
 //MessageF(mtype, "TC_FMR = %08x, PWM_FPE = %08x, PWM_FSR = %08x\n", TC2->TC_FMR, PWM->PWM_FPE, PWM->PWM_FSR);
@@ -1466,6 +1570,8 @@ void Platform::Diagnostics(MessageType mtype)
 
 void Platform::DiagnosticTest(int d)
 {
+	static const uint32_t dummy[2] = { 0, 0 };
+
 	switch (d)
 	{
 	case (int)DiagnosticTestType::TestWatchdog:
@@ -1480,34 +1586,72 @@ void Platform::DiagnosticTest(int d)
 		debugPrintf("Diagnostic Test\n");
 		break;
 
+	case (int)DiagnosticTestType::DivideByZero:			// do an integer divide by zero to test exception handling
+		(void)RepRap::DoDivide(1, 0);					// call function in another module so it can't be optimised away
+		break;
+
+	case (int)DiagnosticTestType::UnalignedMemoryAccess:	// do an unaligned memory access to test exception handling
+		SCB->CCR |= SCB_CCR_UNALIGN_TRP_Msk;			// by default, unaligned memory accesses are allowed, so change that
+		(void)RepRap::ReadDword(reinterpret_cast<const char*>(dummy) + 1);	// call function in another module so it can't be optimised away
+		break;
+
+	case (int)DiagnosticTestType::BusFault:
+		// Read from the "Undefined (Abort)" area
+#ifdef DUET_NG
+		(void)RepRap::ReadDword(reinterpret_cast<const char*>(0x20800000));
+#else
+		(void)RepRap::ReadDword(reinterpret_cast<const char*>(0x20200000));
+#endif
+		break;
+
 	case (int)DiagnosticTestType::PrintMoves:
 		DDA::PrintMoves();
 		break;
+
+	case (int)DiagnosticTestType::TimeSquareRoot:		// Show the square root calculation time. The displayed value is subject to interrupts.
+		{
+			const uint32_t num1 = 0x7265ac3d;
+			const uint32_t now1 = Platform::GetInterruptClocks();
+			const uint32_t num1a = isqrt64((uint64_t)num1 * num1);
+			const uint32_t tim1 = Platform::GetInterruptClocks() - now1;
+
+			const uint32_t num2 = 0x0000a4c5;
+			const uint32_t now2 = Platform::GetInterruptClocks();
+			const uint32_t num2a = isqrt64((uint64_t)num2 * num2);
+			const uint32_t tim2 = Platform::GetInterruptClocks() - now2;
+			MessageF(GENERIC_MESSAGE, "Square roots: 64-bit %.1fus %s, 32-bit %.1fus %s\n",
+					(float)(tim1 * 1000000)/DDA::stepClockRate, (num1a == num1) ? "ok" : "ERROR",
+							(float)(tim2 * 1000000)/DDA::stepClockRate, (num2a == num2) ? "ok" : "ERROR");
+		}
+		break;
+
+#ifdef DUET_NG
+	case (int)DiagnosticTestType::PrintExpanderStatus:
+		MessageF(GENERIC_MESSAGE, "Expander status %04X\n", DuetExpansion::DiagnosticRead());
+		break;
+#endif
 
 	default:
 		break;
 	}
 }
 
+extern "C" uint32_t _estack;		// this is defined in the linker script
+
 // Return the stack usage and amount of memory that has never been used, in bytes
-void Platform::GetStackUsage(size_t* currentStack, size_t* maxStack, size_t* neverUsed) const
+void Platform::GetStackUsage(uint32_t* currentStack, uint32_t* maxStack, uint32_t* neverUsed) const
 {
-	const char *ramend = (const char *)
-#ifdef DUET_NG
-		0x20020000;			// 0x20000000 + 128Kb
-#else
-		0x20088000;			// 0x20070000 + 96Kb
-#endif
+	const char * const ramend = (const char *)&_estack;
 	register const char * stack_ptr asm ("sp");
-	const char *heapend = sbrk(0);
-	const char* stack_lwm = heapend;
+	const char * const heapend = sbrk(0);
+	const char * stack_lwm = heapend;
 	while (stack_lwm < stack_ptr && *stack_lwm == memPattern)
 	{
 		++stack_lwm;
 	}
-	if (currentStack) { *currentStack = ramend - stack_ptr; }
-	if (maxStack) { *maxStack = ramend - stack_lwm; }
-	if (neverUsed) { *neverUsed = stack_lwm - heapend; }
+	if (currentStack != nullptr) { *currentStack = ramend - stack_ptr; }
+	if (maxStack != nullptr) { *maxStack = ramend - stack_lwm; }
+	if (neverUsed != nullptr) { *neverUsed = stack_lwm - heapend; }
 }
 
 void Platform::ClassReport(float &lastTime)
@@ -1550,40 +1694,18 @@ float Platform::GetTemperature(size_t heater, TemperatureError& err)
 		const volatile ThermistorAveragingFilter& filter = thermistorFilters[heater];
 		if (filter.IsValid())
 		{
-			int rawTemp = filter.GetSum()/(THERMISTOR_AVERAGE_READINGS >> AD_OVERSAMPLE_BITS);
+			const int32_t averagedReading = filter.GetSum()/(ThermistorAverageReadings >> Thermistor::AdcOversampleBits);
+			const float temp = thermistors[heater].CalcTemperature(averagedReading);
 
-			// If the ADC reading is N then for an ideal ADC, the input voltage is at least N/(AD_RANGE + 1) and less than (N + 1)/(AD_RANGE + 1), times the analog reference.
-			// So we add 0.5 to to the reading to get a better estimate of the input.
-			float reading = (float) rawTemp + 0.5;
-
-			// Recognise the special case of thermistor disconnected.
-			// For some ADCs, the high-end offset is negative, meaning that the ADC never returns a high enough value. We need to allow for this here.
-			const PidParameters& p = nvData.pidParams[heater];
-			if (p.adcHighOffset < 0.0)
-			{
-				rawTemp -= (int) p.adcHighOffset;
-			}
-			if (rawTemp >= (int)AD_DISCONNECTED_VIRTUAL)
+			if (temp < MinimumConnectedTemperature)
 			{
 				// thermistor is disconnected
 				err = TemperatureError::openCircuit;
 				return ABS_ZERO;
 			}
 
-			// Correct for the low and high ADC offsets
-			reading -= p.adcLowOffset;
-			reading *= (AD_RANGE_VIRTUAL + 1) / (AD_RANGE_VIRTUAL + 1 + p.adcHighOffset - p.adcLowOffset);
-
-			float resistance = reading * p.thermistorSeriesR / ((AD_RANGE_VIRTUAL + 1) - reading);
-			if (resistance > p.GetRInf())
-			{
-				err = TemperatureError::success;
-				return ABS_ZERO + p.GetBeta() / log(resistance / p.GetRInf());
-			}
-
-			// Thermistor short circuit, return a high temperature
-			err = TemperatureError::shortCircuit;
-			return BAD_ERROR_TEMPERATURE;
+			err = TemperatureError::success;
+			return temp;
 		}
 
 		// Filter is not ready yet
@@ -1637,26 +1759,7 @@ bool Platform::AnyHeaterHot(uint16_t heaters, float t)
 	return false;
 }
 
-// Update the heater PID parameters or thermistor resistance etc.
-void Platform::SetPidParameters(size_t heater, const PidParameters& params)
-{
-	if (heater < HEATERS && params != nvData.pidParams[heater])
-	{
-		nvData.pidParams[heater] = params;
-		if (autoSaveEnabled)
-		{
-			WriteNvData();
-		}
-		SetTemperatureLimit(temperatureLimit);		// recalculate the thermistor resistance at max allowed temperature for the tick ISR
-	}
-}
-const PidParameters& Platform::GetPidParameters(size_t heater) const
-{
-	return nvData.pidParams[heater];
-}
-
-// power is a fraction in [0,1]
-
+// Power is a fraction in [0,1]
 void Platform::SetHeater(size_t heater, float power)
 {
 	if (heatOnPins[heater] != NoPin)
@@ -1710,7 +1813,7 @@ EndStopHit Platform::Stopped(size_t drive) const
 		else if (endStopType[drive] == EndStopType::noEndStop)
 		{
 			// No homing switch is configured for this axis, so see if we should use the Z probe
-			if (nvData.zProbeType > 0 && drive < reprap.GetGCodes()->GetNumAxes() && (nvData.zProbeAxes & (1 << drive)) != 0)
+			if (zProbeType > 0 && drive < reprap.GetGCodes()->GetNumAxes() && (zProbeAxes & (1 << drive)) != 0)
 			{
 				return GetZProbeResult();			// using the Z probe as a low homing stop for this axis, so just get its result
 			}
@@ -1741,11 +1844,30 @@ uint32_t Platform::GetAllEndstopStates() const
 // Return the Z probe result. We assume that if the Z probe is used as an endstop, it is used as the low stop.
 EndStopHit Platform::GetZProbeResult() const
 {
-	const int zProbeVal = ZProbe();
-	const int zProbeADValue = GetZProbeParameters().adcValue;
+	const int zProbeVal = GetZProbeReading();
+	const int zProbeADValue = GetCurrentZProbeParameters().adcValue;
 	return (zProbeVal >= zProbeADValue) ? EndStopHit::lowHit
 			: (zProbeVal * 10 >= zProbeADValue * 9) ? EndStopHit::lowNear	// if we are at/above 90% of the target value
 				: EndStopHit::noStop;
+}
+
+// Write the Z probe parameters to file
+bool Platform::WriteZProbeParameters(FileStore *f) const
+{
+	bool ok = f->Write("; Z probe parameters\n");
+	if (ok)
+	{
+		ok = irZProbeParameters.WriteParameters(f, 1);
+	}
+	if (ok)
+	{
+		ok = alternateZProbeParameters.WriteParameters(f, 3);
+	}
+	if (ok)
+	{
+		ok = switchZProbeParameters.WriteParameters(f, 4);
+	}
+	return ok;
 }
 
 // This is called from the step ISR as well as other places, so keep it fast
@@ -2128,7 +2250,8 @@ void Platform::SetFanValue(size_t fan, float speed)
 // Enable or disable the fan that shares its PWM pin with the last heater. Called when we disable or enable the last heater.
 void Platform::EnableSharedFan(bool enable)
 {
-	fans[NUM_FANS - 1].Init((enable) ? COOLING_FAN_PINS[NUM_FANS - 1] : NoPin, FansHardwareInverted());
+	const size_t sharedFanNumber = NUM_FANS - 1;
+	fans[sharedFanNumber].Init((enable) ? COOLING_FAN_PINS[sharedFanNumber] : NoPin, FansHardwareInverted(sharedFanNumber));
 }
 
 #endif
@@ -2146,13 +2269,14 @@ float Platform::GetFanRPM()
 			: 0.0;															// else assume fan is off or tacho not connected
 }
 
-bool Platform::FansHardwareInverted() const
+bool Platform::FansHardwareInverted(size_t fanNumber) const
 {
 #if defined(DUET_NG) || defined(__RADDS__)
 	return false;
 #else
-	// The cooling fan output pin gets inverted on a Duet 0.6 or 0.7
-	return board == BoardType::Duet_06 || board == BoardType::Duet_07;
+	// The cooling fan output pin gets inverted on a Duet 0.6 or 0.7.
+	// We allow a second fan controlled by a mosfet on the PC4 pin, which is not inverted.
+	return fanNumber == 0 && (board == BoardType::Duet_06 || board == BoardType::Duet_07);
 #endif
 }
 
@@ -2160,14 +2284,19 @@ void Platform::InitFans()
 {
 	for (size_t i = 0; i < NUM_FANS; ++i)
 	{
-		fans[i].Init(COOLING_FAN_PINS[i], FansHardwareInverted());
+		fans[i].Init(COOLING_FAN_PINS[i], FansHardwareInverted(i));
 	}
 
 	if (NUM_FANS > 1)
 	{
+#ifdef DUET_NG
 		// Set fan 1 to be thermostatic by default, monitoring all heaters except the default bed heater
-		fans[1].SetHeatersMonitored(0xFFFF & ~(1 << BED_HEATER));
+		fans[1].SetHeatersMonitored(0xFFFF & ~(1 << DefaultBedHeater));
 		fans[1].SetValue(1.0);												// set it full on
+#else
+		// Fan 1 on the Duet 0.8.5 shares its control pin with heater 6. Set it full on to make sure the heater (if present) is off.
+		fans[1].SetValue(1.0);												// set it full on
+#endif
 	}
 
 	coolingFanRpmPin = COOLING_FAN_RPM_PIN;
@@ -2180,18 +2309,9 @@ void Platform::InitFans()
 
 void Platform::SetMACAddress(uint8_t mac[])
 {
-	bool changed = false;
 	for (size_t i = 0; i < 6; i++)
 	{
-		if (nvData.macAddress[i] != mac[i])
-		{
-			nvData.macAddress[i] = mac[i];
-			changed = true;
-		}
-	}
-	if (changed && autoSaveEnabled)
-	{
-		WriteNvData();
+		macAddress[i] = mac[i];
 	}
 }
 
@@ -2228,11 +2348,24 @@ void Platform::AppendAuxReply(const char *msg)
 	// Discard this response if either no aux device is attached or if the response is empty
 	if (msg[0] != 0 && HaveAux())
 	{
-		// Regular text-based responses for AUX are currently stored and processed by M105/M408
-		if (auxGCodeReply != nullptr || OutputBuffer::Allocate(auxGCodeReply))
+		if (msg[0] == '{')
 		{
-			auxSeq++;
-			auxGCodeReply->cat(msg);
+			// JSON responses are always sent directly to the AUX device
+			OutputBuffer *buf;
+			if (OutputBuffer::Allocate(buf))
+			{
+				buf->copy(msg);
+				auxOutput->Push(buf);
+			}
+		}
+		else
+		{
+			// Regular text-based responses for AUX are currently stored and processed by M105/M408
+			if (auxGCodeReply != nullptr || OutputBuffer::Allocate(auxGCodeReply))
+			{
+				auxSeq++;
+				auxGCodeReply->cat(msg);
+			}
 		}
 	}
 }
@@ -2309,22 +2442,6 @@ void Platform::Message(MessageType type, const char *message)
 						return;
 					}
 					usbOutput->Push(usbOutputBuffer);
-				}
-
-				// Check if we need to write the indentation chars first
-				const size_t stackPointer = reprap.GetGCodes()->GetStackPointer();
-				if (stackPointer > 0)
-				{
-					// First, make sure we get the indentation right
-					char indentation[StackSize * 2 + 1];
-					for(size_t i = 0; i < stackPointer * 2; i++)
-					{
-						indentation[i] = ' ';
-					}
-					indentation[stackPointer * 2] = 0;
-
-					// Append the indentation string
-					usbOutputBuffer->cat(indentation);
 				}
 
 				// Append the message string
@@ -2542,18 +2659,20 @@ void Platform::SetBoardType(BoardType bt)
 {
 	if (bt == BoardType::Auto)
 	{
-#ifdef DUET_NG
+#if defined(DUET_NG) && defined(DUET_WIFI)
 		board = BoardType::DuetWiFi_10;
+#elif defined(DUET_NG) && defined(DUET_ETHERNET)
+		board = BoardType::DuetEthernet_10;
 #elif defined(__RADDS__)
 		board = BoardType::RADDS_15;
 #else
 		// Determine whether this is a Duet 0.6 or a Duet 0.8.5 board.
 		// If it is a 0.85 board then DAC0 (AKA digital pin 67) is connected to ground via a diode and a 2.15K resistor.
-		// So we enable the pullup (value 150K-150K) on pin 67 and read it, expecting a LOW on a 0.8.5 board and a HIGH on a 0.6 board.
+		// So we enable the pullup (value 100K-150K) on pin 67 and read it, expecting a LOW on a 0.8.5 board and a HIGH on a 0.6 board.
 		// This may fail if anyone connects a load to the DAC0 pin on a Duet 0.6, hence we implement board selection in M115 as well.
 		pinMode(Dac0DigitalPin, INPUT_PULLUP);
 		board = (digitalRead(Dac0DigitalPin)) ? BoardType::Duet_06 : BoardType::Duet_085;
-		pinMode(Dac0DigitalPin, INPUT);	// turn pullup off
+		pinMode(Dac0DigitalPin, INPUT);			// turn pullup off
 #endif
 	}
 	else
@@ -2573,8 +2692,10 @@ const char* Platform::GetElectronicsString() const
 {
 	switch (board)
 	{
-#ifdef DUET_NG
+#if defined(DUET_NG) && defined(DUET_WIFI)
 	case BoardType::DuetWiFi_10:			return "Duet WiFi 1.0";
+#elif defined(DUET_NG) && defined(DUET_ETHERNET)
+	case BoardType::DuetEthernet_10:		return "Duet Ethernet 1.0";
 #elif defined(__RADDS__)
 	case BoardType::RADDS_15:				return "RADDS 1.5";
 #else
@@ -2591,8 +2712,10 @@ const char* Platform::GetBoardString() const
 {
 	switch (board)
 	{
-#ifdef DUET_NG
+#if defined(DUET_NG) && defined(DUET_WIFI)
 	case BoardType::DuetWiFi_10:			return "duetwifi10";
+#elif defined(DUET_NG) && defined(DUET_ETHERNET)
+	case BoardType::DuetEthernet_10:		return "duetethernet10";
 #elif defined(__RADDS__)
 	case BoardType::RADDS_15:				return "radds15";
 #else
@@ -2607,60 +2730,59 @@ const char* Platform::GetBoardString() const
 // User I/O and servo support
 bool Platform::GetFirmwarePin(int logicalPin, PinAccess access, Pin& firmwarePin, bool& invert)
 {
-#ifdef __RADDS__
-# error This needs to be modified for RADDS
-#endif
 	firmwarePin = NoPin;										// assume failure
 	invert = false;												// this is the common case
 	if (logicalPin < 0 || logicalPin > HighestLogicalPin)
 	{
 		// Pin number out of range, so nothing to do here
 	}
-	else if (logicalPin < HEATERS)								// pins 0-9 correspond to heater channels
+	else if (logicalPin >= Heater0LogicalPin && logicalPin < Heater0LogicalPin + HEATERS)		// pins 0-9 correspond to heater channels
 	{
 		// For safety, we don't allow a heater channel to be used for servos until the heater has been disabled
-		if (!reprap.GetHeat()->IsHeaterEnabled(logicalPin))
+		if (!reprap.GetHeat()->IsHeaterEnabled(logicalPin - Heater0LogicalPin))
 		{
-			firmwarePin = heatOnPins[logicalPin];
+			firmwarePin = heatOnPins[logicalPin - Heater0LogicalPin];
 			invert = !HEAT_ON;
 		}
 	}
-	else if (logicalPin >= 20 && logicalPin < 20 + (int)NUM_FANS)	// pins 100-107 correspond to fan channels
+	else if (logicalPin >= Fan0LogicalPin && logicalPin < Fan0LogicalPin + (int)NUM_FANS)		// pins 20- correspond to fan channels
 	{
 		// Don't allow a fan channel to be used unless the fan has been disabled
-		if (!fans[logicalPin - 20].IsEnabled()
+		if (!fans[logicalPin - Fan0LogicalPin].IsEnabled()
 #ifdef DUET_NG
 			// Fan pins on the DueX2/DueX5 cannot be used to control servos because the frequency is not well-defined.
-			&& (logicalPin <= 22 || access != PinAccess::servo)
+			&& (logicalPin <= Fan0LogicalPin + 2 || access != PinAccess::servo)
 #endif
 		   )
 		{
-			firmwarePin = COOLING_FAN_PINS[logicalPin - 20];
+			firmwarePin = COOLING_FAN_PINS[logicalPin - Fan0LogicalPin];
+#if !defined(DUET_NG) && !defined(__RADDS__)
+			invert = (board == BoardType::Duet_06 || board == BoardType::Duet_07);
+#endif
 		}
 	}
-	else if (logicalPin >= 40 && logicalPin < 40 + (int)ARRAY_SIZE(endStopPins))	// pins 40-49 correspond to endstop pins
+	else if (logicalPin >= EndstopXLogicalPin && logicalPin < EndstopXLogicalPin + (int)ARRAY_SIZE(endStopPins))	// pins 40-49 correspond to endstop pins
 	{
 		if (access == PinAccess::read
 #ifdef DUET_NG
 			// Endstop pins on the DueX2/DueX5 can be used as digital outputs too
-			|| (access == PinAccess::write && logicalPin >= 45)
+			|| (access == PinAccess::write && logicalPin >= EndstopXLogicalPin + 5)
 #endif
 		   )
 		{
-			firmwarePin = endStopPins[logicalPin - 40];
+			firmwarePin = endStopPins[logicalPin - EndstopXLogicalPin];
 		}
 	}
-	else if (logicalPin >= 60 && logicalPin < 60 + (int)ARRAY_SIZE(SpecialPinMap))
+	else if (logicalPin >= Special0LogicalPin && logicalPin < Special0LogicalPin + (int)ARRAY_SIZE(SpecialPinMap))
 	{
-		firmwarePin = SpecialPinMap[logicalPin - 60];
+		firmwarePin = SpecialPinMap[logicalPin - Special0LogicalPin];
 	}
 #ifdef DUET_NG
-	else if (logicalPin >= 100 && logicalPin <= 103)			// Pins 100-103 are the GPIO pins on the DueX2/X5
+	else if (logicalPin >= DueX5Gpio0LogicalPin && logicalPin < DueX5Gpio0LogicalPin + (int)ARRAY_SIZE(DueX5GpioPinMap))	// Pins 100-103 are the GPIO pins on the DueX2/X5
 	{
-		static const Pin DueX5GpioPinMap[] = { 211, 210, 209, 208 };
 		if (access != PinAccess::servo)
 		{
-			firmwarePin = DueX5GpioPinMap[logicalPin - 100];
+			firmwarePin = DueX5GpioPinMap[logicalPin - DueX5Gpio0LogicalPin];
 		}
 	}
 #endif
@@ -2669,9 +2791,13 @@ bool Platform::GetFirmwarePin(int logicalPin, PinAccess access, Pin& firmwarePin
 	{
 		// Check that the pin mode has been defined suitably
 		PinMode desiredMode;
-		if (access == PinAccess::write || access == PinAccess::servo)
+		if (access == PinAccess::write)
 		{
-			desiredMode = (firmwarePin >= 100) ? OUTPUT_PWM : OUTPUT_LOW;
+			desiredMode = (invert) ? OUTPUT_HIGH : OUTPUT_LOW;
+		}
+		else if (access == PinAccess::pwm || access == PinAccess::servo)
+		{
+			desiredMode = (invert) ? OUTPUT_PWM_HIGH : OUTPUT_PWM_LOW;
 		}
 		else
 		{
@@ -2685,6 +2811,11 @@ bool Platform::GetFirmwarePin(int logicalPin, PinAccess access, Pin& firmwarePin
 		return true;
 	}
 	return false;
+}
+
+bool Platform::SetExtrusionAncilliaryPwmPin(int logicalPin)
+{
+	return GetFirmwarePin(logicalPin, PinAccess::pwm, extrusionAncilliaryPwmFirmwarePin, extrusionAncilliaryPwmInvert);
 }
 
 #if SUPPORT_INKJET
@@ -2774,6 +2905,7 @@ char Platform::ReadFromSource(const SerialSource source)
 	return 0;
 }
 
+#ifndef __RADDS__
 // CPU temperature
 void Platform::GetMcuTemperatures(float& minT, float& currT, float& maxT) const
 {
@@ -2781,6 +2913,7 @@ void Platform::GetMcuTemperatures(float& minT, float& currT, float& maxT) const
 	currT = AdcReadingToCpuTemperature(currentMcuTemperature);
 	maxT = AdcReadingToCpuTemperature(highestMcuTemperature);
 }
+#endif
 
 #ifdef DUET_NG
 // Power in voltage
@@ -2796,32 +2929,77 @@ void Platform::GetPowerVoltages(float& minV, float& currV, float& maxV) const
 
 bool Platform::IsDateTimeSet() const
 {
-	return RTCDue::IsDateTimeSet();
+	return realTime != 0;
 }
 
 time_t Platform::GetDateTime() const
 {
-	return RTCDue::GetDateTime();
+	return realTime;
 }
 
 bool Platform::SetDateTime(time_t time)
 {
-	return RTCDue::SetDateTime(time);
+	struct tm brokenDateTime;
+	const bool ok = (gmtime_r(&time, &brokenDateTime) != nullptr);
+	if (ok)
+	{
+		realTime = time;
+		timeLastUpdatedMillis = millis();
+	}
+	return ok;
 }
 
 bool Platform::SetDate(time_t date)
 {
-	return RTCDue::SetDate(date);
+	// Check the validity of the date passed in
+	struct tm brokenNewDate;
+	const bool ok = (gmtime_r(&date, &brokenNewDate) != nullptr);
+	if (ok)
+	{
+		struct tm brokenTimeNow;
+		if (realTime == 0 || gmtime_r(&realTime, &brokenTimeNow) == nullptr)
+		{
+			// We didn't have a valid date/time set, so set the date and time to the value passed in
+			realTime = date;
+			timeLastUpdatedMillis = millis();
+		}
+		else
+		{
+			// Merge the existing time into the date passed in
+			brokenNewDate.tm_hour = brokenTimeNow.tm_hour;
+			brokenNewDate.tm_min = brokenTimeNow.tm_min;
+			brokenNewDate.tm_sec = brokenTimeNow.tm_sec;
+			realTime = mktime(&brokenNewDate);
+		}
+	}
+	return ok;
 }
 
 bool Platform::SetTime(time_t time)
 {
-	return RTCDue::SetTime(time);
+	// Check the validity of the date passed in
+	struct tm brokenNewTime;
+	const bool ok = (gmtime_r(&time, &brokenNewTime) != nullptr);
+	if (ok)
+	{
+		struct tm brokenTimeNow;
+		if (realTime == 0 || gmtime_r(&realTime, &brokenTimeNow) == nullptr)
+		{
+			// We didn't have a valid date/time set, so set the date and time to the value passed in
+			realTime = time;
+		}
+		else
+		{
+			// Merge the new time into the current date/time
+			brokenTimeNow.tm_hour = brokenNewTime.tm_hour;
+			brokenTimeNow.tm_min = brokenNewTime.tm_min;
+			brokenTimeNow.tm_sec = brokenNewTime.tm_sec;
+			realTime = mktime(&brokenTimeNow);
+		}
+		timeLastUpdatedMillis = millis();
+	}
+	return ok;
 }
-
-// Pragma pop_options is not supported on this platform, so we put this time-critical code right at the end of the file
-//#pragma GCC push_options
-#pragma GCC optimize ("O3")
 
 // Step pulse timer interrupt
 void STEP_TC_HANDLER()
@@ -2903,54 +3081,40 @@ void Platform::Tick()
 	{
 	case 1:			// last conversion started was a thermistor
 	case 3:
+		if (IsThermistorChannel(currentHeater))
 		{
-			if (IsThermistorChannel(currentHeater))
-			{
-				ThermistorAveragingFilter& currentFilter = const_cast<ThermistorAveragingFilter&>(thermistorFilters[currentHeater]);
-				currentFilter.ProcessReading(AnalogInReadChannel(thermistorAdcChannels[heaterTempChannels[currentHeater]]));
-				if (currentFilter.IsValid() && (configuredHeaters & (1 << currentHeater)) != 0)
-				{
-					uint32_t sum = currentFilter.GetSum();
-					if (sum < thermistorOverheatSums[currentHeater] || sum >= AD_DISCONNECTED_REAL * THERMISTOR_AVERAGE_READINGS)
-					{
-						// We have an over-temperature or disconnected reading from this thermistor, so turn off the heater
-						SetHeater(currentHeater, 0.0);
-						LogError(ErrorCode::BadTemp);
-					}
-				}
-			}
-			else
-			{
-				// Thermocouple case: oversampling is not necessary as the MAX31855 is itself continuously sampling and
-				// averaging.  As such, the temperature reading is taken directly by Platform::GetTemperature() and
-				// periodically called by PID::Spin() where temperature fault handling is taken care of.  However, we
-				// must guard against overly long delays between successive calls of PID::Spin().
-				// Do not call Time() here, it isn't safe. We use millis() instead.
-				if ((millis() - reprap.GetHeat()->GetLastSampleTime(currentHeater)) > maxPidSpinDelay)
-				{
-					SetHeater(currentHeater, 0.0);
-					LogError(ErrorCode::BadTemp);
-				}
-			}
+			// Because we are in the tick ISR and no other ISR reads the averaging filter, we can cast away 'volatile' here
+			ThermistorAveragingFilter& currentFilter = const_cast<ThermistorAveragingFilter&>(thermistorFilters[currentHeater]);
+			currentFilter.ProcessReading(AnalogInReadChannel(thermistorAdcChannels[heaterTempChannels[currentHeater]]));
+		}
 
-			++currentHeater;
-			if (currentHeater == HEATERS)
-			{
-				currentHeater = 0;
-			}
+		// Guard against overly long delays between successive calls of PID::Spin().
+		// Do not call Time() here, it isn't safe. We use millis() instead.
+		if ((configuredHeaters & (1 << currentHeater)) != 0 && (millis() - reprap.GetHeat()->GetLastSampleTime(currentHeater)) > maxPidSpinDelay)
+		{
+			SetHeater(currentHeater, 0.0);
+			LogError(ErrorCode::BadTemp);
+		}
+
+		++currentHeater;
+		if (currentHeater == HEATERS)
+		{
+			currentHeater = 0;
 		}
 		++tickState;
 		break;
 
 	case 2:			// last conversion started was the Z probe, with IR LED on
 		const_cast<ZProbeAveragingFilter&>(zProbeOnFilter).ProcessReading(GetRawZProbeReading());
-		if (nvData.zProbeType == 2)								// if using a modulated IR sensor
+		if (zProbeType == 2)									// if using a modulated IR sensor
 		{
 			digitalWrite(zProbeModulationPin, LOW);				// turn off the IR emitter
 		}
 
 		// Read the MCU temperature as well (no need to do it in every state)
+#ifndef __RADDS__
 		currentMcuTemperature = AnalogInReadChannel(temperatureAdcChannel);
+#endif
 
 		++tickState;
 		break;
@@ -2960,7 +3124,7 @@ void Platform::Tick()
 		// no break
 	case 0:			// this is the state after initialisation, no conversion has been started
 	default:
-		if (nvData.zProbeType == 2)								// if using a modulated IR sensor
+		if (zProbeType == 2)									// if using a modulated IR sensor
 		{
 			digitalWrite(zProbeModulationPin, HIGH);			// turn on the IR emitter
 		}

@@ -8,7 +8,15 @@
 #ifndef DDA_H_
 #define DDA_H_
 
+#include "RepRapFirmware.h"
 #include "DriveMovement.h"
+#include "GCodes/GCodes.h"			// for class RawMove
+
+#ifdef DUET_NG
+#define DDA_LOG_PROBE_CHANGES	1
+#else
+#define DDA_LOG_PROBE_CHANGES	0		// save memory on the wired Duet
+#endif
 
 /**
  * This defines a single linear movement of the print head
@@ -41,7 +49,7 @@ public:
 	void Prepare();													// Calculate all the values and freeze this DDA
 	float CalcTime() const;											// Calculate the time needed for this move (used for simulation)
 	bool HasStepError() const;
-	bool CanPause() const { return canPause; }
+	bool CanPauseAfter() const { return canPauseAfter; }
 	bool IsPrintingMove() const { return isPrintingMove; }			// Return true if this involves both XY movement and extrusion
 
 	DDAState GetState() const { return state; }
@@ -60,25 +68,32 @@ public:
 
 	void DebugPrint() const;
 
-	static const uint32_t stepClockRate = VARIANT_MCK/32;			// the frequency of the clock used for stepper pulse timing, about 0.38us resolution on the Duet
+	static const uint32_t stepClockRate = VARIANT_MCK/128;			// the frequency of the clock used for stepper pulse timing (see Platform::InitialiseInterrupts)
 	static const uint64_t stepClockRateSquared = (uint64_t)stepClockRate * stepClockRate;
 
 	// Note on the following constant:
 	// If we calculate the step interval on every clock, we reach a point where the calculation time exceeds the step interval.
 	// The worst case is pure Z movement on a delta. On a Mini Kossel with 80 steps/mm with this firmware running on a Duet (84MHx SAM3X8 processor),
 	// the calculation can just be managed in time at speeds of 15000mm/min (step interval 50us), but not at 20000mm/min (step interval 37.5us).
-	// Therefore, where the step interval falls below 70us, we don't calculate on every step.
+	// Therefore, where the step interval falls below 60us, we don't calculate on every step.
+	// Note: the above measurements were taken some time ago, before some firmware optimisations.
 #ifdef DUET_NG
-	static const int32_t MinCalcIntervalDelta = (50 * stepClockRate)/1000000; 		// the smallest sensible interval between calculations (70us) in step timer clocks
-	static const int32_t MinCalcIntervalCartesian = (50 * stepClockRate)/1000000;	// same as delta for now, but could be lower
+	static const int32_t MinCalcIntervalDelta = (40 * stepClockRate)/1000000; 		// the smallest sensible interval between calculations (40us) in step timer clocks
+	static const int32_t MinCalcIntervalCartesian = (40 * stepClockRate)/1000000;	// same as delta for now, but could be lower
 	static const uint32_t minInterruptInterval = 6;					// about 2us minimum interval between interrupts, in clocks
 #else
-	static const int32_t MinCalcIntervalDelta = (70 * stepClockRate)/1000000; 		// the smallest sensible interval between calculations (70us) in step timer clocks
-	static const int32_t MinCalcIntervalCartesian = (70 * stepClockRate)/1000000;	// same as delta for now, but could be lower
+	static const int32_t MinCalcIntervalDelta = (60 * stepClockRate)/1000000; 		// the smallest sensible interval between calculations (60us) in step timer clocks
+	static const int32_t MinCalcIntervalCartesian = (60 * stepClockRate)/1000000;	// same as delta for now, but could be lower
 	static const uint32_t minInterruptInterval = 6;					// about 2us minimum interval between interrupts, in clocks
 #endif
 
 	static void PrintMoves();										// print saved moves for debugging
+
+#if DDA_LOG_PROBE_CHANGES
+	static const size_t MaxLoggedProbePositions = 40;
+	static size_t numLoggedProbePositions;
+	static int32_t loggedProbePositions[MIN_AXES * MaxLoggedProbePositions];
+#endif
 
 private:
 	void RecalculateMove();
@@ -90,6 +105,7 @@ private:
 	DriveMovement *RemoveDM(size_t drive);
 	bool IsDecelerationMove() const;								// return true if this move is or have been might have been intended to be a deceleration-only move
 	void DebugPrintVector(const char *name, const float *vec, size_t len) const;
+	void CheckEndstops(Platform *platform);
 
 	static void DoLookahead(DDA *laDDA);							// called by AdjustEndSpeed to do the real work
     static float Normalise(float v[], size_t dim1, size_t dim2);  	// Normalise a vector of dim1 dimensions to unit length in the first dim1 dimensions
@@ -105,7 +121,7 @@ private:
 	volatile DDAState state;				// what state this DDA is in
 	uint8_t endCoordinatesValid : 1;		// True if endCoordinates can be relied on
 	uint8_t isDeltaMovement : 1;			// True if this is a delta printer movement
-	uint8_t canPause : 1;					// True if we can pause at the end of this move
+	uint8_t canPauseAfter : 1;				// True if we can pause at the end of this move
 	uint8_t goingSlow : 1;					// True if we have reduced speed during homing
 	uint8_t isPrintingMove : 1;				// True if this move includes XY movement and extrusion
 	uint8_t usePressureAdvance : 1;			// True if pressure advance should be applied to any forward extrusion
@@ -140,6 +156,12 @@ private:
 	uint32_t clocksNeeded;					// in clocks
 	uint32_t moveStartTime;					// clock count at which the move was started
 
+#if DDA_LOG_PROBE_CHANGES
+	static bool probeTriggered;
+
+	void LogProbePosition();
+#endif
+
     DriveMovement* firstDM;					// the contained DM that needs the first step
 
 	DriveMovement ddm[DRIVES];				// These describe the state of each drive movement
@@ -158,20 +180,6 @@ inline void DDA::SetDriveCoordinate(int32_t a, size_t drive)
 {
 	endPoint[drive] = a;
 	endCoordinatesValid = false;
-}
-
-// Insert the specified drive into the step list, in step time order.
-// We insert the drive before any existing entries with the same step time for best performance. Now that we generate step pulses
-// for multiple motors simultaneously, there is no need to preserve round-robin order.
-inline void DDA::InsertDM(DriveMovement *dm)
-{
-	DriveMovement **dmp = &firstDM;
-	while (*dmp != nullptr && (*dmp)->nextStepTime < dm->nextStepTime)
-	{
-		dmp = &((*dmp)->nextDM);
-	}
-	dm->nextDM = *dmp;
-	*dmp = dm;
 }
 
 #endif /* DDA_H_ */

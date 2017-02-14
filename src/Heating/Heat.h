@@ -25,7 +25,9 @@ Licence: GPL
  * The master class that controls all the heaters in the RepRap machine
  */
 
+#include "RepRapFirmware.h"
 #include "Pid.h"
+#include "MessageType.h"
 
 class Heat
 {
@@ -37,10 +39,10 @@ public:
 	void Spin();												// Called in a tight loop to keep everything going
 	void Init();												// Set everything up
 	void Exit();												// Shut everything down
+	void ResetHeaterModels();									// Reset all active heater models to defaults
 
 	bool ColdExtrude() const;									// Is cold extrusion allowed?
-	void AllowColdExtrude();									// Allow cold extrusion
-	void DenyColdExtrude();										// Deny cold extrusion
+	void AllowColdExtrude(bool b);								// Allow or deny cold extrusion
 
 	int8_t GetBedHeater() const									// Get hot bed heater number
 	post(-1 <= result; result < HEATERS);
@@ -58,6 +60,8 @@ public:
 	float GetActiveTemperature(int8_t heater) const;
 	void SetStandbyTemperature(int8_t heater, float t);
 	float GetStandbyTemperature(int8_t heater) const;
+	void SetTemperatureLimit(int8_t heater, float t);
+	float GetTemperatureLimit(int8_t heater) const;
 	void Activate(int8_t heater);								// Turn on a heater
 	void Standby(int8_t heater);								// Set a heater idle
 	float GetTemperature(int8_t heater) const;					// Get the temperature of a heater
@@ -66,7 +70,7 @@ public:
 	void SwitchOffAll();										// Turn all heaters off
 	void ResetFault(int8_t heater);								// Reset a heater fault - only call this if you know what you are doing
 	bool AllHeatersAtSetTemperatures(bool includingBed) const;	// Is everything at temperature within tolerance?
-	bool HeaterAtSetTemperature(int8_t heater) const;			// Is a specific heater at temperature within tolerance?
+	bool HeaterAtSetTemperature(int8_t heater, bool waitWhenCooling) const;	// Is a specific heater at temperature within tolerance?
 	void Diagnostics(MessageType mtype);						// Output useful information
 
 	float GetAveragePWM(size_t heater) const					// Return the running average PWM to the heater as a fraction in [0, 1].
@@ -91,12 +95,6 @@ public:
 	bool SetHeaterModel(size_t heater, float gain, float tc, float td, float maxPwm, bool usePid) // Set the heater process model
 	pre(heater < HEATERS);
 
-	bool IsModelUsed(size_t heater) const						// Is the heater using the PID parameters calculated form the model?
-	pre(heater < HEATERS);
-
-	void UseModel(size_t heater, bool b)						// Use or don't use the model to provide the PID parameters
-	pre(heater < HEATERS);
-
 	void GetHeaterProtection(size_t heater, float& maxTempExcursion, float& maxFaultTime) const
 	pre(heater < HEATERS);
 
@@ -105,6 +103,13 @@ public:
 
 	bool IsHeaterEnabled(size_t heater) const					// Is this heater enabled?
 	pre(heater < HEATERS);
+
+	float GetHighestTemperatureLimit() const;					// Get the highest temperature limit of any heater
+
+	void SetM301PidParameters(size_t heater, const M301PidParameters& params)
+	pre(heater < HEATERS);
+
+	bool WriteModelParameters(FileStore *f) const;				// Write heater model parameters to file returning true if no error
 
 private:
 	Platform* platform;											// The instance of the RepRap hardware class
@@ -128,14 +133,9 @@ inline bool Heat::ColdExtrude() const
 	return coldExtrude;
 }
 
-inline void Heat::AllowColdExtrude()
+inline void Heat::AllowColdExtrude(bool b)
 {
-	coldExtrude = true;
-}
-
-inline void Heat::DenyColdExtrude()
-{
-	coldExtrude = false;
+	coldExtrude = b;
 }
 
 inline int8_t Heat::GetBedHeater() const
@@ -168,18 +168,6 @@ inline const FopDt& Heat::GetHeaterModel(size_t heater) const
 inline bool Heat::SetHeaterModel(size_t heater, float gain, float tc, float td, float maxPwm, bool usePid)
 {
 	return pids[heater]->SetModel(gain, tc, td, maxPwm, usePid);
-}
-
-// Is the heater using the PID parameters calculated form the model?
-inline bool Heat::IsModelUsed(size_t heater) const
-{
-	return pids[heater]->IsModelUsed();
-}
-
-// Use or don't use the model to provide the PID parameters
-inline void Heat::UseModel(size_t heater, bool b)
-{
-	pids[heater]->UseModel(b);
 }
 
 // Is the heater enabled?

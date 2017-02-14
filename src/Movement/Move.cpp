@@ -5,9 +5,11 @@
  *      Author: David
  */
 
-#include "RepRapFirmware.h"
+#include "Move.h"
+#include "Platform.h"
+#include "RepRap.h"
 
-Move::Move(Platform* p, GCodes* g) : currentDda(NULL)
+Move::Move(Platform* p, GCodes* g) : currentDda(NULL), grid(zBedProbePoints)
 {
 	active = false;
 
@@ -46,6 +48,7 @@ void Move::Init()
 
 	currentDda = nullptr;
 	addNoMoreMoves = false;
+	babysteppingLeft = 0.0;
 	stepErrors = 0;
 	numLookaheadUnderruns = numPrepareUnderruns = 0;
 
@@ -66,19 +69,28 @@ void Move::Init()
 	SetPositions(move);
 
 	// Set up default bed probe points. This is only a guess, because we don't know the bed size yet.
-	for (size_t point = 0; point < MAX_PROBE_POINTS; point++)
+	for (size_t point = 0; point < ARRAY_SIZE(zBedProbePoints); point++)
 	{
 		if (point < 4)
 		{
-			xBedProbePoints[point] = (0.3 + 0.6*(float)(point%2))*reprap.GetPlatform()->AxisMaximum(X_AXIS);
-			yBedProbePoints[point] = (0.0 + 0.9*(float)(point/2))*reprap.GetPlatform()->AxisMaximum(Y_AXIS);
+			xBedProbePoints[point] = (0.1 + 0.8 * (float)(point%2)) * reprap.GetPlatform()->AxisMaximum(X_AXIS);
+			yBedProbePoints[point] = (0.1 + 0.8 * (float)(point/2)) * reprap.GetPlatform()->AxisMaximum(Y_AXIS);
+		}
+		else if (point == 4)
+		{
+			xBedProbePoints[point] = 0.5 * reprap.GetPlatform()->AxisMaximum(X_AXIS);
+			yBedProbePoints[point] = 0.5 * reprap.GetPlatform()->AxisMaximum(Y_AXIS);
 		}
 		zBedProbePoints[point] = 0.0;
-		probePointSet[point] = unset;
+		if (point < ARRAY_SIZE(probePointSet))
+		{
+			probePointSet[point] = unset;
+		}
 	}
 
-	xRectangle = 1.0/(0.8*reprap.GetPlatform()->AxisMaximum(X_AXIS));
+	xRectangle = 1.0/(0.8 * reprap.GetPlatform()->AxisMaximum(X_AXIS));
 	yRectangle = xRectangle;
+	useTaper = false;
 
 	longWait = reprap.GetPlatform()->Time();
 	idleTimeout = DEFAULT_IDLE_TIMEOUT;
@@ -173,49 +185,16 @@ void Move::Spin()
 				if (simulationMode < 2)		// in simulation mode 2 and higher, we don't process incoming moves beyond this point
 				{
 
-#if 0	//*** This code is not finished yet ***
-					// If we are doing bed compensation and the move crosses a compensation boundary by a significant amount,
-					// segment it so that we can apply proper bed compensation
-					// Issues here:
-					// 1. Are there enough DDAs? need to make nextMove static and remember whether we have the remains of a move in there.
-					// 2. Pause/restart: if we restart a segmented move when we have already executed part of it, we will extrude too much.
-					// Perhaps remember how much of the last move we executed? Or always insist on completing all the segments in a move?
-					bool isSegmented;
-					do
-					{
-						GCodes::RawMove tempMove = nextMove;
-						isSegmented = SegmentMove(tempMove);
-						if (isSegmented)
-						{
-							// Extruder moves are relative, so we need to adjust the extrusion amounts in the original move
-							for (size_t drive = AXES; drive < DRIVES; ++drive)
-							{
-								nextMove.coords[drive] -= tempMove.coords[drive];
-							}
-						}
-						bool doMotorMapping = (moveType == 0) || (moveType == 1 && !IsDeltaMode());
-						if (doMotorMapping)
-						{
-							Transform(tempMove);
-						}
-						if (ddaRingAddPointer->Init(tempMove.coords, nextMove.feedRate, nextMove.endStopsToCheck, doMotorMapping, nextMove.filePos))
-						{
-							ddaRingAddPointer = ddaRingAddPointer->GetNext();
-							idleCount = 0;
-						}
-					} while (isSegmented);
-#else	// Use old code
-					bool doMotorMapping = (nextMove.moveType == 0) || (nextMove.moveType == 1 && !IsDeltaMode());
+					const bool doMotorMapping = (nextMove.moveType == 0) || (nextMove.moveType == 1 && !IsDeltaMode());
 					if (doMotorMapping)
 					{
-						Transform(nextMove.coords);
+						Transform(nextMove.coords, nextMove.xAxes, true);
 					}
 					if (ddaRingAddPointer->Init(nextMove, doMotorMapping))
 					{
 						ddaRingAddPointer = ddaRingAddPointer->GetNext();
 						idleCount = 0;
 					}
-#endif
 				}
 			}
 			else
@@ -322,7 +301,7 @@ void Move::Spin()
 // Returns the file position of the first queue move we are going to skip, or noFilePosition we we are not skipping any moves.
 // We update 'positions' to the positions and feed rate expected for the next move, and the amount of extrusion in the moves we skipped.
 // If we are not skipping any moves then the feed rate is left alone, therefore the caller should set this up first.
-FilePosition Move::PausePrint(float positions[DRIVES], float& pausedFeedRate)
+FilePosition Move::PausePrint(float positions[DRIVES], float& pausedFeedRate, uint32_t xAxes)
 {
 	// Find a move we can pause after.
 	// Ideally, we would adjust a move if necessary and possible so that we can pause after it, but for now we don't do that.
@@ -335,11 +314,13 @@ FilePosition Move::PausePrint(float positions[DRIVES], float& pausedFeedRate)
 	const DDA *savedDdaRingAddPointer = ddaRingAddPointer;
 	cpu_irq_disable();
 	DDA *dda = currentDda;
+	FilePosition fPos = noFilePosition;
 	if (dda != nullptr)
 	{
 		// A move is being executed. See if we can safely pause at the end of it.
-		if (dda->CanPause())
+		if (dda->CanPauseAfter())
 		{
+			fPos = dda->GetFilePosition();
 			ddaRingAddPointer = dda->GetNext();
 		}
 		else
@@ -349,8 +330,9 @@ FilePosition Move::PausePrint(float positions[DRIVES], float& pausedFeedRate)
 			dda = ddaRingGetPointer;
 			while (dda != ddaRingAddPointer)
 			{
-				if (dda->CanPause())
+				if (dda->CanPauseAfter())
 				{
+					fPos = dda->GetFilePosition();
 					ddaRingAddPointer = dda->GetNext();
 					if (ddaRingAddPointer->GetState() == DDA::frozen)
 					{
@@ -370,8 +352,6 @@ FilePosition Move::PausePrint(float positions[DRIVES], float& pausedFeedRate)
 	}
 
 	cpu_irq_enable();
-
-	FilePosition fPos = noFilePosition;
 
 	if (ddaRingAddPointer != savedDdaRingAddPointer)
 	{
@@ -396,10 +376,6 @@ FilePosition Move::PausePrint(float positions[DRIVES], float& pausedFeedRate)
 			{
 				positions[drive] += dda->GetEndCoordinate(drive, true);		// update the amount of extrusion we are going to skip
 			}
-			if (fPos == noFilePosition)
-			{
-				fPos = dda->GetFilePosition();
-			}
 			(void)dda->Free();
 			dda = dda->GetNext();
 		}
@@ -407,10 +383,17 @@ FilePosition Move::PausePrint(float positions[DRIVES], float& pausedFeedRate)
 	}
 	else
 	{
-		GetCurrentUserPosition(positions, 0);		// gets positions and clears out extrusion values
+		GetCurrentUserPosition(positions, 0, xAxes);		// gets positions and clears out extrusion values
 	}
 
 	return fPos;
+}
+
+// Request babystepping
+void Move::Babystep(float zMovement)
+{
+	babysteppingLeft += zMovement;
+	// TODO use this value somewhere
 }
 
 uint32_t maxReps = 0;
@@ -423,12 +406,44 @@ extern uint64_t lastNum;
 
 void Move::Diagnostics(MessageType mtype)
 {
-	reprap.GetPlatform()->Message(mtype, "=== Move ===\n");
-	reprap.GetPlatform()->MessageF(mtype, "MaxReps: %u, StepErrors: %u, MaxWait: %ums, Underruns: %u, %u\n",
-											maxReps, stepErrors, longestGcodeWaitInterval, numLookaheadUnderruns, numPrepareUnderruns);
+	Platform * const p = reprap.GetPlatform();
+	p->Message(mtype, "=== Move ===\n");
+	p->MessageF(mtype, "MaxReps: %u, StepErrors: %u, MaxWait: %ums, Underruns: %u, %u\n",
+						maxReps, stepErrors, longestGcodeWaitInterval, numLookaheadUnderruns, numPrepareUnderruns);
 	maxReps = 0;
 	numLookaheadUnderruns = numPrepareUnderruns = 0;
 	longestGcodeWaitInterval = 0;
+
+	// Show the current probe position heights and type of bed compensation in use
+	p->Message(mtype, "Bed compensation in use: ");
+	if (numBedCompensationPoints == 0)
+	{
+		p->MessageF(mtype, "%s\n", (grid.UsingHeightMap()) ? "mesh" : "none");
+	}
+	else
+	{
+		p->MessageF(mtype, "%d point\n", numBedCompensationPoints);
+	}
+	p->Message(mtype, "Bed probe heights:");
+	for (size_t i = 0; i < MaxProbePoints; ++i)
+	{
+		p->MessageF(mtype, " %.3f", ZBedProbePoint(i));
+	}
+	p->Message(mtype, "\n");
+
+#if DDA_LOG_PROBE_CHANGES
+	// Temporary code to print Z probe trigger positions
+	p->Message(mtype, "Probe change coordinates:");
+	char ch = ' ';
+	for (size_t i = 0; i < DDA::numLoggedProbePositions; ++i)
+	{
+		float xyzPos[MIN_AXES];
+		MachineToEndPoint(DDA::loggedProbePositions + (MIN_AXES * i), xyzPos, MIN_AXES);
+		p->MessageF(mtype, "%c%.2f,%.2f", ch, xyzPos[X_AXIS], xyzPos[Y_AXIS]);
+		ch = ',';
+	}
+	p->Message(mtype, "\n");
+#endif
 
 #if 0
 	// For debugging
@@ -475,7 +490,7 @@ int32_t Move::MotorEndPointToMachine(size_t drive, float coord)
 // This is computationally expensive on a delta, so only call it when necessary, and never from the step ISR.
 void Move::MachineToEndPoint(const int32_t motorPos[], float machinePos[], size_t numDrives) const
 {
-	const float *stepsPerUnit = reprap.GetPlatform()->GetDriveStepsPerUnit();
+	const float * const stepsPerUnit = reprap.GetPlatform()->GetDriveStepsPerUnit();
 
 	// Convert the axes
 	if (IsDeltaMode())
@@ -611,83 +626,155 @@ float Move::MotorFactor(size_t drive, const float directionVector[]) const
 void Move::AxisTransform(float xyzPoint[MAX_AXES]) const
 {
 	//TODO should we transform U axis instead of/as well as X if we are in dual carriage mode?
-	xyzPoint[X_AXIS] = xyzPoint[X_AXIS] + tanXY*xyzPoint[Y_AXIS] + tanXZ*xyzPoint[Z_AXIS];
-	xyzPoint[Y_AXIS] = xyzPoint[Y_AXIS] + tanYZ*xyzPoint[Z_AXIS];
+	xyzPoint[X_AXIS] += tanXY*xyzPoint[Y_AXIS] + tanXZ*xyzPoint[Z_AXIS];
+	xyzPoint[Y_AXIS] += tanYZ*xyzPoint[Z_AXIS];
 }
 
 // Invert the Axis transform AFTER the bed transform
 void Move::InverseAxisTransform(float xyzPoint[MAX_AXES]) const
 {
 	//TODO should we transform U axis instead of/as well as X if we are in dual carriage mode?
-	xyzPoint[Y_AXIS] = xyzPoint[Y_AXIS] - tanYZ*xyzPoint[Z_AXIS];
-	xyzPoint[X_AXIS] = xyzPoint[X_AXIS] - (tanXY*xyzPoint[Y_AXIS] + tanXZ*xyzPoint[Z_AXIS]);
+	xyzPoint[Y_AXIS] -= tanYZ*xyzPoint[Z_AXIS];
+	xyzPoint[X_AXIS] -= (tanXY*xyzPoint[Y_AXIS] + tanXZ*xyzPoint[Z_AXIS]);
 }
 
-void Move::Transform(float xyzPoint[MAX_AXES]) const
+void Move::Transform(float xyzPoint[MAX_AXES], uint32_t xAxes, bool useBedCompensation) const
 {
 	AxisTransform(xyzPoint);
-	BedTransform(xyzPoint);
+	if (useBedCompensation)
+	{
+		BedTransform(xyzPoint, xAxes);
+	}
 }
 
-void Move::InverseTransform(float xyzPoint[MAX_AXES]) const
+void Move::InverseTransform(float xyzPoint[MAX_AXES], uint32_t xAxes) const
 {
-	InverseBedTransform(xyzPoint);
+	InverseBedTransform(xyzPoint, xAxes);
 	InverseAxisTransform(xyzPoint);
 }
 
 // Do the bed transform AFTER the axis transform
-void Move::BedTransform(float xyzPoint[MAX_AXES]) const
+void Move::BedTransform(float xyzPoint[MAX_AXES], uint32_t xAxes) const
 {
-	switch(numBedCompensationPoints)
+	if (!useTaper || xyzPoint[Z_AXIS] < taperHeight)
 	{
-	case 0:
-		break;
+		float zCorrection = 0.0;
+		const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
+		unsigned int numXAxes = 0;
 
-	case 3:
-		xyzPoint[Z_AXIS] += aX*xyzPoint[X_AXIS] + aY*xyzPoint[Y_AXIS] + aC;
-		break;
+		// Transform the Z coordinate based on the average correction for each axis used as an X axis.
+		// We are assuming that the tool Y offsets are small enough to be ignored.
+		for (uint32_t axis = 0; axis < numAxes; ++axis)
+		{
+			if ((xAxes & (1u << axis)) != 0)
+			{
+				const float xCoord = xyzPoint[axis];
+				switch(numBedCompensationPoints)
+				{
+				case 0:
+					zCorrection += grid.GetInterpolatedHeightError(xCoord, xyzPoint[Y_AXIS]);
+					break;
 
-	case 4:
-		xyzPoint[Z_AXIS] += SecondDegreeTransformZ(xyzPoint[X_AXIS], xyzPoint[Y_AXIS]);
-		break;
+				case 3:
+					zCorrection += aX * xCoord + aY * xyzPoint[Y_AXIS] + aC;
+					break;
 
-	case 5:
-		xyzPoint[Z_AXIS] += TriangleZ(xyzPoint[X_AXIS], xyzPoint[Y_AXIS]);
-		break;
+				case 4:
+					zCorrection += SecondDegreeTransformZ(xCoord, xyzPoint[Y_AXIS]);
+					break;
 
-	default:
-		reprap.GetPlatform()->Message(GENERIC_MESSAGE, "BedTransform: wrong number of sample points.");
+				case 5:
+					zCorrection += TriangleZ(xCoord, xyzPoint[Y_AXIS]);
+					break;
+
+				default:
+					break;
+				}
+				++numXAxes;
+			}
+		}
+
+		if (numXAxes > 1)
+		{
+			zCorrection /= numXAxes;			// take an average
+		}
+
+		xyzPoint[Z_AXIS] += (useTaper) ? (taperHeight - xyzPoint[Z_AXIS]) * recipTaperHeight * zCorrection : zCorrection;
 	}
 }
 
 // Invert the bed transform BEFORE the axis transform
-void Move::InverseBedTransform(float xyzPoint[MAX_AXES]) const
+void Move::InverseBedTransform(float xyzPoint[MAX_AXES], uint32_t xAxes) const
 {
-	switch(numBedCompensationPoints)
+	float zCorrection = 0.0;
+	const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
+	unsigned int numXAxes = 0;
+
+	// Transform the Z coordinate based on the average correction for each axis used as an X axis.
+	// We are assuming that the tool Y offsets are small enough to be ignored.
+	for (uint32_t axis = 0; axis < numAxes; ++axis)
 	{
-	case 0:
-		break;
+		if ((xAxes & (1u << axis)) != 0)
+		{
+			const float xCoord = xyzPoint[axis];
+			switch(numBedCompensationPoints)
+			{
+			case 0:
+				zCorrection += grid.GetInterpolatedHeightError(xCoord, xyzPoint[Y_AXIS]);
+				break;
 
-	case 3:
-		xyzPoint[Z_AXIS] -= (aX*xyzPoint[X_AXIS] + aY*xyzPoint[Y_AXIS] + aC);
-		break;
+			case 3:
+				zCorrection += aX * xCoord + aY * xyzPoint[Y_AXIS] + aC;
+				break;
 
-	case 4:
-		xyzPoint[Z_AXIS] -= SecondDegreeTransformZ(xyzPoint[X_AXIS], xyzPoint[Y_AXIS]);
-		break;
+			case 4:
+				zCorrection += SecondDegreeTransformZ(xCoord, xyzPoint[Y_AXIS]);
+				break;
 
-	case 5:
-		xyzPoint[Z_AXIS] -= TriangleZ(xyzPoint[X_AXIS], xyzPoint[Y_AXIS]);
-		break;
+			case 5:
+				zCorrection += TriangleZ(xCoord, xyzPoint[Y_AXIS]);
+				break;
 
-	default:
-		reprap.GetPlatform()->Message(GENERIC_MESSAGE, "InverseBedTransform: wrong number of sample points.");
+			default:
+				break;
+			}
+			++numXAxes;
+		}
+	}
+
+	if (numXAxes > 1)
+	{
+		zCorrection /= numXAxes;					// take an average
+	}
+
+	if (!useTaper || zCorrection >= taperHeight)	// need check on zCorrection to avoid possible divide by zero
+	{
+		xyzPoint[Z_AXIS] -= zCorrection;
+	}
+	else
+	{
+		const float zreq = (xyzPoint[Z_AXIS] - zCorrection)/(1.0 - (zCorrection * recipTaperHeight));
+		if (zreq < taperHeight)
+		{
+			xyzPoint[Z_AXIS] = zreq;
+		}
 	}
 }
 
 void Move::SetIdentityTransform()
 {
 	numBedCompensationPoints = 0;
+	grid.ClearGridHeights();
+}
+
+void Move::SetTaperHeight(float h)
+{
+	useTaper = (h > 1.0);
+	if (useTaper)
+	{
+		taperHeight = h;
+		recipTaperHeight = 1.0/h;
+	}
 }
 
 float Move::AxisCompensation(int8_t axis) const
@@ -729,13 +816,13 @@ void Move::SetAxisCompensation(int8_t axis, float tangent)
 
 void Move::BarycentricCoordinates(size_t p1, size_t p2, size_t p3, float x, float y, float& l1, float& l2, float& l3) const
 {
-	float y23 = baryYBedProbePoints[p2] - baryYBedProbePoints[p3];
-	float x3 = x - baryXBedProbePoints[p3];
-	float x32 = baryXBedProbePoints[p3] - baryXBedProbePoints[p2];
-	float y3 = y - baryYBedProbePoints[p3];
-	float x13 = baryXBedProbePoints[p1] - baryXBedProbePoints[p3];
-	float y13 = baryYBedProbePoints[p1] - baryYBedProbePoints[p3];
-	float iDet = 1.0 / (y23 * x13 + x32 * y13);
+	const float y23 = baryYBedProbePoints[p2] - baryYBedProbePoints[p3];
+	const float x3 = x - baryXBedProbePoints[p3];
+	const float x32 = baryXBedProbePoints[p3] - baryXBedProbePoints[p2];
+	const float y3 = y - baryYBedProbePoints[p3];
+	const float x13 = baryXBedProbePoints[p1] - baryXBedProbePoints[p3];
+	const float y13 = baryYBedProbePoints[p1] - baryYBedProbePoints[p3];
+	const float iDet = 1.0 / (y23 * x13 + x32 * y13);
 	l1 = (y23 * x3 + x32 * y3) * iDet;
 	l2 = (-y13 * x3 + x13 * y3) * iDet;
 	l3 = 1.0 - l1 - l2;
@@ -756,7 +843,7 @@ float Move::TriangleZ(float x, float y) const
 {
 	for (size_t i = 0; i < 4; i++)
 	{
-		size_t j = (i + 1) % 4;
+		const size_t j = (i + 1) % 4;
 		float l1, l2, l3;
 		BarycentricCoordinates(i, j, 4, x, y, l1, l2, l3);
 		if (l1 > TRIANGLE_ZERO && l2 > TRIANGLE_ZERO && l3 > TRIANGLE_ZERO)
@@ -850,7 +937,7 @@ void Move::FinishedBedProbing(int sParam, StringRef& reply)
 
 	// Clear out the Z heights so that we don't re-use old points.
 	// This allows us to use different numbers of probe point on different occasions.
-	for (size_t i = 0; i < MAX_PROBE_POINTS; ++i)
+	for (size_t i = 0; i < MaxProbePoints; ++i)
 	{
 		probePointSet[i] &= ~zSet;
 	}
@@ -981,30 +1068,21 @@ void Move::DoDeltaCalibration(size_t numFactors, StringRef& reply)
 	//uint32_t startTime = reprap.GetPlatform()->GetInterruptClocks();
 
 	// Transform the probing points to motor endpoints and store them in a matrix, so that we can do multiple iterations using the same data
-	FixedMatrix<floatc_t, MAX_DELTA_PROBE_POINTS, DELTA_AXES> probeMotorPositions;
-	floatc_t corrections[MAX_DELTA_PROBE_POINTS];
+	FixedMatrix<floatc_t, MaxDeltaCalibrationPoints, DELTA_AXES> probeMotorPositions;
+	floatc_t corrections[MaxDeltaCalibrationPoints];
 	float_t initialSumOfSquares = 0.0;
 	for (size_t i = 0; i < numPoints; ++i)
 	{
 		corrections[i] = 0.0;
 		float machinePos[DELTA_AXES];
-		float xp = xBedProbePoints[i], yp = yBedProbePoints[i];
-		if (probePointSet[i] & xyCorrected)
-		{
-			// The point was probed with the sensor at the specified XY coordinates, so subtract the sensor offset to get the head position
-			const ZProbeParameters& zparams = reprap.GetPlatform()->GetZProbeParameters();
-			xp -= zparams.xOffset;
-			yp -= zparams.yOffset;
-		}
-		machinePos[X_AXIS] = xp;
-		machinePos[Y_AXIS] = yp;
+		float zp = GetProbeCoordinates(i, machinePos[X_AXIS], machinePos[Y_AXIS], (probePointSet[i] & xyCorrected) != 0);
 		machinePos[Z_AXIS] = 0.0;
 
 		probeMotorPositions(i, A_AXIS) = deltaParams.Transform(machinePos, A_AXIS);
 		probeMotorPositions(i, B_AXIS) = deltaParams.Transform(machinePos, B_AXIS);
 		probeMotorPositions(i, C_AXIS) = deltaParams.Transform(machinePos, C_AXIS);
 
-		initialSumOfSquares += fsquare(zBedProbePoints[i]);
+		initialSumOfSquares += fsquare(zp);
 	}
 
 	// Do 1 or more Newton-Raphson iterations
@@ -1013,7 +1091,7 @@ void Move::DoDeltaCalibration(size_t numFactors, StringRef& reply)
 	for (;;)
 	{
 		// Build a Nx9 matrix of derivatives with respect to xa, xb, yc, za, zb, zc, diagonal.
-		FixedMatrix<floatc_t, MAX_DELTA_PROBE_POINTS, NumDeltaFactors> derivativeMatrix;
+		FixedMatrix<floatc_t, MaxDeltaCalibrationPoints, NumDeltaFactors> derivativeMatrix;
 		for (size_t i = 0; i < numPoints; ++i)
 		{
 			for (size_t j = 0; j < numFactors; ++j)
@@ -1064,7 +1142,7 @@ void Move::DoDeltaCalibration(size_t numFactors, StringRef& reply)
 			PrintVector("Solution", solution, numFactors);
 
 			// Calculate and display the residuals
-			floatc_t residuals[MAX_DELTA_PROBE_POINTS];
+			floatc_t residuals[MaxDeltaCalibrationPoints];
 			for (size_t i = 0; i < numPoints; ++i)
 			{
 				residuals[i] = zBedProbePoints[i];
@@ -1081,7 +1159,7 @@ void Move::DoDeltaCalibration(size_t numFactors, StringRef& reply)
 
 		// Calculate the expected probe heights using the new parameters
 		{
-			floatc_t expectedResiduals[MAX_DELTA_PROBE_POINTS];
+			floatc_t expectedResiduals[MaxDeltaCalibrationPoints];
 			floatc_t sumOfSquares = 0.0;
 			for (size_t i = 0; i < numPoints; ++i)
 			{
@@ -1107,7 +1185,10 @@ void Move::DoDeltaCalibration(size_t numFactors, StringRef& reply)
 		// Decide whether to do another iteration. Two is slightly better than one, but three doesn't improve things.
 		// Alternatively, we could stop when the expected RMS error is only slightly worse than the RMS of the residuals.
 		++iteration;
-		if (iteration == 2) break;
+		if (iteration == 2)
+		{
+			break;
+		}
 	}
 
 	// Print out the calculation time
@@ -1169,8 +1250,8 @@ void Move::DeltaProbeInterrupt()
 			deltaProbe.Trigger();
 		}
 
-		bool dir = deltaProbe.GetDirection();
-		Platform *platform = reprap.GetPlatform();
+		const bool dir = deltaProbe.GetDirection();
+		Platform * const platform = reprap.GetPlatform();
 		platform->SetDirection(X_AXIS, dir);
 		platform->SetDirection(Y_AXIS, dir);
 		platform->SetDirection(Z_AXIS, dir);
@@ -1179,7 +1260,7 @@ void Move::DeltaProbeInterrupt()
 		Platform::StepDriversHigh(steppersMoving);
 		ShortDelay();
 		Platform::StepDriversLow();
-		uint32_t tim = deltaProbe.CalcNextStepTime();
+		const uint32_t tim = deltaProbe.CalcNextStepTime();
 		again = (tim != 0xFFFFFFFF && platform->ScheduleInterrupt(tim + deltaProbingStartTime));
 	} while (again);
 }
@@ -1229,11 +1310,9 @@ void Move::HitHighStop(size_t axis, DDA* hitDDA)
 {
 	if (axis < reprap.GetGCodes()->GetNumAxes())		// should always be true
 	{
-		float hitPoint = (IsDeltaMode())
-							? deltaParams.GetHomedCarriageHeight(axis)
-							        // this is a delta printer, so the motor is at the homed carriage height for this drive
-							: reprap.GetPlatform()->AxisMaximum(axis);
-									// this is a Cartesian printer, so we're at the maximum for this axis
+		const float hitPoint = (IsDeltaMode())
+								? deltaParams.GetHomedCarriageHeight(axis)	// this is a delta printer, so the motor is at the homed carriage height for this drive
+								: reprap.GetPlatform()->AxisMaximum(axis);	// this is a Cartesian printer, so we're at the maximum for this axis
 		JustHomed(axis, hitPoint, hitDDA);
 	}
 }
@@ -1269,7 +1348,7 @@ void Move::ZProbeTriggered(DDA* hitDDA)
 // Return the untransformed machine coordinates
 void Move::GetCurrentMachinePosition(float m[DRIVES], bool disableMotorMapping) const
 {
-	DDA *lastQueuedMove = ddaRingAddPointer->GetPrevious();
+	DDA * const lastQueuedMove = ddaRingAddPointer->GetPrevious();
 	const size_t numAxes = reprap.GetGCodes()->GetNumAxes();
 	for (size_t i = 0; i < DRIVES; i++)
 	{
@@ -1293,24 +1372,24 @@ void Move::GetCurrentMachinePosition(float m[DRIVES], bool disableMotorMapping) 
 bool Move::IsExtruding() const
 {
 	cpu_irq_disable();
-	bool rslt = currentDda != nullptr && currentDda->IsPrintingMove();
+	const bool rslt = currentDda != nullptr && currentDda->IsPrintingMove();
 	cpu_irq_enable();
 	return rslt;
 }
 
 // Return the transformed machine coordinates
-void Move::GetCurrentUserPosition(float m[DRIVES], uint8_t moveType) const
+void Move::GetCurrentUserPosition(float m[DRIVES], uint8_t moveType, uint32_t xAxes) const
 {
 	GetCurrentMachinePosition(m, moveType == 2 || (moveType == 1 && IsDeltaMode()));
 	if (moveType == 0)
 	{
-		InverseTransform(m);
+		InverseTransform(m, xAxes);
 	}
 }
 
 // Return the current live XYZ and extruder coordinates
 // Interrupts are assumed enabled on entry, so do not call this from an ISR
-void Move::LiveCoordinates(float m[DRIVES])
+void Move::LiveCoordinates(float m[DRIVES], uint32_t xAxes)
 {
 	// The live coordinates and live endpoints are modified by the ISR, so be careful to get a self-consistent set of them
 	cpu_irq_disable();
@@ -1339,7 +1418,7 @@ void Move::LiveCoordinates(float m[DRIVES])
 		}
 		cpu_irq_enable();
 	}
-	InverseTransform(m);
+	InverseTransform(m, xAxes);
 }
 
 // These are the actual numbers that we want to be the coordinates, so don't transform them.
@@ -1368,7 +1447,7 @@ void Move::ResetExtruderPositions()
 
 void Move::SetXBedProbePoint(size_t index, float x)
 {
-	if (index >= MAX_PROBE_POINTS)
+	if (index >= MaxProbePoints)
 	{
 		reprap.GetPlatform()->Message(GENERIC_MESSAGE, "Z probe point X index out of range.\n");
 		return;
@@ -1379,7 +1458,7 @@ void Move::SetXBedProbePoint(size_t index, float x)
 
 void Move::SetYBedProbePoint(size_t index, float y)
 {
-	if (index >= MAX_PROBE_POINTS)
+	if (index >= MaxProbePoints)
 	{
 		reprap.GetPlatform()->Message(GENERIC_MESSAGE, "Z probe point Y index out of range.\n");
 		return;
@@ -1390,12 +1469,13 @@ void Move::SetYBedProbePoint(size_t index, float y)
 
 void Move::SetZBedProbePoint(size_t index, float z, bool wasXyCorrected, bool wasError)
 {
-	if (index >= MAX_PROBE_POINTS)
+	if (index >= MaxProbePoints)
 	{
 		reprap.GetPlatform()->Message(GENERIC_MESSAGE, "Z probe point Z index out of range.\n");
 	}
 	else
 	{
+		grid.UseHeightMap(false);
 		zBedProbePoints[index] = z;
 		probePointSet[index] |= zSet;
 		if (wasXyCorrected)
@@ -1442,28 +1522,44 @@ bool Move::XYProbeCoordinatesSet(int index) const
 	return (probePointSet[index]  & xSet) && (probePointSet[index]  & ySet);
 }
 
+// This returns the (X, Y) points to probe the bed at probe point count.  When probing, it returns false.
+// If called after probing has ended it returns true, and the Z coordinate probed is also returned.
+// If 'wantNozzlePosition is true then we return the nozzle position when the point is probed, else we return the probe point itself
+float Move::GetProbeCoordinates(int count, float& x, float& y, bool wantNozzlePosition) const
+{
+	x = xBedProbePoints[count];
+	y = yBedProbePoints[count];
+	if (wantNozzlePosition)
+	{
+		const ZProbeParameters& rp = reprap.GetPlatform()->GetCurrentZProbeParameters();
+		x -= rp.xOffset;
+		y -= rp.yOffset;
+	}
+	return zBedProbePoints[count];
+}
+
 size_t Move::NumberOfProbePoints() const
 {
-	for(size_t i = 0; i < MAX_PROBE_POINTS; i++)
+	for(size_t i = 0; i < MaxProbePoints; i++)
 	{
 		if(!AllProbeCoordinatesSet(i))
 		{
 			return i;
 		}
 	}
-	return MAX_PROBE_POINTS;
+	return MaxProbePoints;
 }
 
 size_t Move::NumberOfXYProbePoints() const
 {
-	for(size_t i = 0; i < MAX_PROBE_POINTS; i++)
+	for(size_t i = 0; i < MaxProbePoints; i++)
 	{
 		if(!XYProbeCoordinatesSet(i))
 		{
 			return i;
 		}
 	}
-	return MAX_PROBE_POINTS;
+	return MaxProbePoints;
 }
 
 // Enter or leave simulation mode
@@ -1535,7 +1631,7 @@ int Move::DoDeltaProbe(float frequency, float amplitude, float rate, float dista
 		const uint32_t firstInterruptTime = deltaProbe.Start();
 		if (firstInterruptTime != 0xFFFFFFFF)
 		{
-			Platform *platform = reprap.GetPlatform();
+			Platform * const platform = reprap.GetPlatform();
 			platform->EnableDrive(X_AXIS);
 			platform->EnableDrive(Y_AXIS);
 			platform->EnableDrive(Z_AXIS);

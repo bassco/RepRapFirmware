@@ -8,6 +8,24 @@
 #ifndef DELTAPARAMETERS_H_
 #define DELTAPARAMETERS_H_
 
+#include "RepRapFirmware.h"
+
+#ifdef DUET_NG
+typedef double floatc_t;					// type of matrix element used for delta calibration
+#else
+// We are more memory-constrained on the SAM3X
+typedef float floatc_t;						// type of matrix element used for delta calibration
+#endif
+
+// Delta parameter defaults
+const float defaultPrintRadius = 50;							// mm
+const float defaultDeltaHomedHeight = 200;						// mm
+
+const size_t DELTA_AXES = 3;
+const size_t A_AXIS = 0;
+const size_t B_AXIS = 1;
+const size_t C_AXIS = 2;
+
 // Class to hold the parameter for a delta machine.
 class DeltaParameters
 {
@@ -48,6 +66,7 @@ public:
     floatc_t ComputeDerivative(unsigned int deriv, float ha, float hb, float hc);	// Compute the derivative of height with respect to a parameter at a set of motor endpoints
     void Adjust(size_t numFactors, const floatc_t v[]);								// Perform 3-, 4-, 6- or 7-factor adjustment
     void PrintParameters(StringRef& reply) const;									// Print all the parameters for debugging
+    bool WriteParameters(FileStore *f) const;										// Write parameters to file if in delta mode, returning true if no error
 
 private:
 	void Recalc();

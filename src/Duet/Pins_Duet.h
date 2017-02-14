@@ -1,7 +1,7 @@
 #ifndef PINS_DUET_H__
 #define PINS_DUET_H__
 
-#define NAME "RepRapFirmware for Duet"
+#define FIRMWARE_NAME "RepRapFirmware for Duet"
 
 const size_t NumFirmwareUpdateModules = 1;
 #define IAP_UPDATE_FILE "iap.bin"
@@ -24,8 +24,6 @@ const int8_t HEATERS = 7;						// The number of heaters in the machine; 0 is the
 
 const size_t MAX_AXES = 6;						// The maximum number of movement axes in the machine, usually just X, Y and Z, <= DRIVES
 const size_t MIN_AXES = 3;						// The minimum and default number of axes
-const size_t DELTA_AXES = 3;					// The number of axis involved in delta movement
-const size_t CART_AXES = 3;						// The number of Cartesian axes
 const size_t MaxExtruders = DRIVES - MIN_AXES;	// The maximum number of extruders
 
 const size_t NUM_SERIAL_CHANNELS = 3;			// The number of serial IO channels (USB and two auxiliary UARTs)
@@ -38,10 +36,8 @@ const size_t NUM_SERIAL_CHANNELS = 3;			// The number of serial IO channels (USB
 // DRIVES
 
 const Pin ENABLE_PINS[DRIVES] = { 29, 27, X1, X0, 37, X8, 50, 47, X13 };
-const bool ENABLE_VALUES[DRIVES] = { false, false, false, false, false, false, false, false, false };	// What to send to enable a drive
 const Pin STEP_PINS[DRIVES] = { 14, 25, 5, X2, 41, 39, X4, 49, X10 };
 const Pin DIRECTION_PINS[DRIVES] = { 15, 26, 4, X3, 35, 53, 51, 48, X11 };
-const bool DIRECTIONS[DRIVES] = { BACKWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS };	// What each axis needs to make it go forwards - defaults
 
 // Endstops
 // RepRapFirmware only has a single endstop per axis.
@@ -67,10 +63,14 @@ const Pin HEAT_ON_PINS[HEATERS] = { 6, X5, X7, 7, 8, 9, X17 };			// Heater Chann
 // Hot end thermistor: http://www.digikey.co.uk/product-search/en?x=20&y=11&KeyWords=480-3137-ND
 const float BED_R25 = 10000.0;
 const float BED_BETA = 3988.0;
+const float BED_SHC = 0.0;
 const float EXT_R25 = 100000.0;
-const float EXT_BETA = 4138.0;
+const float EXT_BETA = 4388.0;
+const float EXT_SHC = 0.0;
 
 // Thermistor series resistor value in Ohms
+// On later Duet 0.6 and all Duet 0.8.5 boards it is 4700 ohms. However, if we change the default then machines that have 1K series resistors
+// and don't have R1000 in the M305 commands in config.g will overheat. So for safety we leave the default as 1000.
 const float THERMISTOR_SERIES_RS = 1000.0;
 
 // Number of SPI temperature sensors to support
@@ -114,7 +114,7 @@ const Pin COOLING_FAN_RPM_PIN = 23;										// Pin PA15
 const size_t NumSdCards = 2;
 const Pin SdCardDetectPins[NumSdCards] = {13, NoPin};
 const Pin SdWriteProtectPins[NumSdCards] = {NoPin, NoPin};
-const Pin SdSpiCSPins[1] = {67};										// Note: this clashes with inkjet support
+const Pin SdSpiCSPins[1] = {67};										// Pin PB16 Note: this clashes with inkjet support
 
 #if SUPPORT_INKJET
 // Inkjet control pins

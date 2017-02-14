@@ -1,18 +1,28 @@
 #ifndef PINS_DUETNG_H__
 #define PINS_DUETNG_H__
 
-#define NAME "RepRapFirmware for Duet WiFi"
+#if defined(DUET_WIFI)
 
-const size_t NumFirmwareUpdateModules = 4;			// 3 modules, plus one for manual upload to WiFi module
-#define IAP_UPDATE_FILE		"iap4e.bin"
-#define IAP_FIRMWARE_FILE	"DuetWiFiFirmware.bin"
-#define WIFI_FIRMWARE_FILE	"DuetWiFiServer.bin"
-#define WIFI_WEB_FILE		"DuetWebControl.bin"
+# define FIRMWARE_NAME "RepRapFirmware for Duet WiFi"
+# define DEFAULT_BOARD_TYPE BoardType::DuetWiFi_10
+const size_t NumFirmwareUpdateModules = 4;		// 3 modules, plus one for manual upload to WiFi module
+# define IAP_FIRMWARE_FILE	"DuetWiFiFirmware.bin"
+# define WIFI_FIRMWARE_FILE	"DuetWiFiServer.bin"
+# define WIFI_WEB_FILE		"DuetWebControl.bin"
 
-// Default board type
-#define DEFAULT_BOARD_TYPE BoardType::DuetWiFi_10
+#elif defined(DUET_ETHERNET)
 
-#define SUPPORT_ETHERNET	0					// set nonzero to support embedded web interface over Ethernet
+# define FIRMWARE_NAME "RepRapFirmware for Duet Ethernet"
+# define DEFAULT_BOARD_TYPE BoardType::DuetEthernet_10
+# define IAP_FIRMWARE_FILE	"DuetEthernetFirmware.bin"
+const size_t NumFirmwareUpdateModules = 1;		// 1 module
+
+#else
+# error Firmware name not defined
+#endif
+
+#define IAP_UPDATE_FILE		"iap4e.bin"			// hoping eventually to use the same IAP file for both Duet WiFi and Duet Ethernet
+
 #define SUPPORT_INKJET		0					// set nonzero to support inkjet control
 #define SUPPORT_ROLAND		0					// set nonzero to support Roland mill
 
@@ -27,8 +37,6 @@ const size_t MaxDriversPerAxis = 4;				// The maximum number of stepper drivers 
 
 const size_t MAX_AXES = 6;						// The maximum number of movement axes in the machine, usually just X, Y and Z, <= DRIVES
 const size_t MIN_AXES = 3;						// The minimum and default number of axes
-const size_t DELTA_AXES = 3;					// The number of axis involved in delta movement
-const size_t CART_AXES = 3;						// The number of Cartesian axes
 const size_t MaxExtruders = DRIVES - MIN_AXES;	// The maximum number of extruders
 
 const size_t NUM_SERIAL_CHANNELS = 2;			// The number of serial IO channels (USB and one auxiliary UART)
@@ -43,10 +51,8 @@ const Pin ExpansionStart = 200;					// Pin numbers at/above this are on the I/O 
 
 const Pin GlobalTmcEnablePin = 38;				// The pin that drives ENN of all TMC2660 drivers on production boards (on pre-production boards they are grounded)
 const Pin ENABLE_PINS[DRIVES] = { 78, 41, 42, 49, 57, 87, 88, 89, 90, 31 };
-const bool ENABLE_VALUES[DRIVES] = { false, false, false, false, false, false, false, false, false, false };	// What to send to enable a drive
 const Pin STEP_PINS[DRIVES] = { 70, 71, 72, 69, 68, 66, 65, 64, 67, 91 };
 const Pin DIRECTION_PINS[DRIVES] = { 75, 76, 77, 01, 73, 92, 86, 80, 81, 32 };
-const bool DIRECTIONS[DRIVES] = { FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS, FORWARDS };	// What each axis needs to make it go forwards - defaults
 
 const Pin DueX_SG = 96;				// DueX stallguard detect pin = PE0 (was E2_STOP)
 const Pin DueX_INT = 17;			// DueX interrupt pin = PA17 (was E6_STOP)
@@ -54,7 +60,6 @@ const Pin DueX_INT = 17;			// DueX interrupt pin = PA17 (was E6_STOP)
 // Endstops
 // RepRapFirmware only has a single endstop per axis.
 // Gcode defines if it is a max ("high end") or min ("low end") endstop and sets if it is active HIGH or LOW.
-//const Pin END_STOP_PINS[DRIVES] = { 46, 02, 93, 74, 48, 96, 97, 98, 99, 17 };
 const Pin END_STOP_PINS[DRIVES] = { 46, 02, 93, 74, 48, 200, 203, 202, 201, 213 };
 
 // HEATERS
@@ -64,12 +69,12 @@ const Pin TEMP_SENSE_PINS[HEATERS] = { 45, 47, 44, 61, 62, 63, 59, 18 }; // Ther
 const Pin HEAT_ON_PINS[HEATERS] = { 19, 20, 16, 35, 37, 40, 43, 15 };	// Heater pin numbers (heater 7 pin TBC)
 
 // Default thermistor parameters
-// Bed thermistor: now assuming 100K
-// Hot end thermistor: http://www.digikey.co.uk/product-search/en?x=20&y=11&KeyWords=480-3137-ND
 const float BED_R25 = 100000.0;
 const float BED_BETA = 3988.0;
+const float BED_SHC = 0.0;
 const float EXT_R25 = 100000.0;
 const float EXT_BETA = 4388.0;
+const float EXT_SHC = 0.0;
 
 // Thermistor series resistor value in Ohms
 const float THERMISTOR_SERIES_RS = 4700.0;
